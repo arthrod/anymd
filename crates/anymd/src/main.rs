@@ -19,6 +19,7 @@ fn main() -> anyhow::Result<()> {
         cli::Mode::Setup(arguments) => std::process::exit(setup::run(&arguments)),
         cli::Mode::Cli(arguments) => {
             let policy = SourceAccessPolicy::from_process().map_err(anyhow::Error::msg)?;
+            anymd_formats::cache::prune_images_daily();
             std::process::exit(cli::run(arguments, &policy));
         }
         cli::Mode::Mcp => tokio::runtime::Builder::new_multi_thread()
@@ -50,6 +51,7 @@ fn doctor() {
 }
 
 async fn serve() -> anyhow::Result<()> {
+    anymd_formats::cache::prune_images_daily();
     let source_access = SourceAccessPolicy::from_process().map_err(anyhow::Error::msg)?;
     if source_access.is_restricted() {
         eprintln!(
