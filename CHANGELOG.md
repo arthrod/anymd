@@ -6,6 +6,7 @@
 
 - `cargo install anymd` works. Each release now also publishes the Rust crates to [crates.io](https://crates.io/crates/anymd): `anymd`, `anymd-core`, `anymd-formats`, `anymd-pdf`, and two forks of upstream crates that carry our fixes, `anymd-pdf-extract` (from `pdf-extract`) and `anymd-adobe-cmap-parser` (from `adobe-cmap-parser`). The forks keep the upstream MIT licence and credit. npm stays the primary install.
 - `sylphx-mcp-kit` now comes from crates.io (0.2.3) instead of a git tag.
+- Word tracked changes and comments come out as CriticMarkup: insertions `{++…++}`, deletions `{--…--}`, a deletion next to an insertion as `{~~old~>new~~}`, and commented text as `{==text==}{>>Author (date): comment<<}`. Each tracked change is followed by its author and date, `{++new++}{>>Author (date)<<}`, the way CriticMarkup tracks several authors. Authors and dates are exactly as Word stores them. Inserted and deleted paragraph breaks, table rows and cells, text boxes, and footnotes are covered, and the output nests cleanly so simple CriticMarkup parsers read it.
 
 ## 8.1.0
 

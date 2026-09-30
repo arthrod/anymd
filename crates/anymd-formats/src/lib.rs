@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(feature = "native"), allow(dead_code))]
 
+mod critic;
 pub mod csv;
 pub mod docx;
 pub mod epub;
