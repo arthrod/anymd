@@ -9,6 +9,7 @@ FILE.rejected.txt next to FILE.docx.
 """
 
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -22,7 +23,6 @@ import uno
 PropertyValue = uno.getClass("com.sun.star.beans.PropertyValue")
 NoConnectException = uno.getClass("com.sun.star.connection.NoConnectException")
 
-PORT = 2099
 COMMANDS = {
     "accepted": ".uno:AcceptAllTrackedChanges",
     "rejected": ".uno:RejectAllTrackedChanges",
@@ -39,19 +39,26 @@ def prop(name: str, *, value: object) -> Any:
     return property_value
 
 
-def connect(attempts: int = 60) -> Any:
-    """Return the context of the office started on PORT, once it listens."""
+def free_port() -> int:
+    """Pick a port no other run is using, so two runs never share an office."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def connect(port: int, attempts: int = 60) -> Any:
+    """Return the context of the office started on `port`, once it listens."""
     local = uno.getComponentContext()
     resolver = local.ServiceManager.createInstanceWithContext(
         "com.sun.star.bridge.UnoUrlResolver", local
     )
-    url = f"uno:socket,host=127.0.0.1,port={PORT};urp;StarOffice.ComponentContext"
+    url = f"uno:socket,host=127.0.0.1,port={port};urp;StarOffice.ComponentContext"
     for _ in range(attempts):
         try:
             return resolver.resolve(url)
         except NoConnectException:
             time.sleep(1)
-    message = f"LibreOffice did not listen on port {PORT}"
+    message = f"LibreOffice did not listen on port {port}"
     raise SystemExit(message)
 
 
@@ -60,23 +67,24 @@ def main(document: Path, profile: Path) -> None:
     if document.suffix != ".docx" or not document.is_file():
         message = f"not a .docx file: {document}"
         raise SystemExit(message)
+    port = free_port()
     soffice = shutil.which("soffice")
     if soffice is None:
         message = "soffice is not on PATH"
         raise SystemExit(message)
-    office = subprocess.Popen(  # noqa: S603 - fixed argv, no shell; the paths are the caller's own
+    office = subprocess.Popen(
         [
             soffice,
             f"-env:UserInstallation={profile.resolve().as_uri()}",
             "--headless",
             "--norestore",
-            f"--accept=socket,host=127.0.0.1,port={PORT};urp;",
+            f"--accept=socket,host=127.0.0.1,port={port};urp;",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
-        context = connect()
+        context = connect(port)
         manager = context.ServiceManager
         desktop = manager.createInstanceWithContext(
             "com.sun.star.frame.Desktop", context

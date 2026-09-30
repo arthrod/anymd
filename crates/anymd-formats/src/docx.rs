@@ -61,11 +61,17 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
         note_refs: Vec::new(),
         revisions: Vec::new(),
         comments: HashMap::new(),
+        notes: HashMap::new(),
         referenced: HashSet::new(),
         open_comments: Vec::new(),
+        pending_notes: Vec::new(),
+        in_comment: false,
     };
     if let Some(root) = &comments {
-        writer.comments = writer.comment_notes(root);
+        writer.comments = root
+            .children_named("comment")
+            .filter_map(|c| c.attr("id").map(|id| (id.to_string(), c.clone())))
+            .collect();
     }
     let mut references = Vec::new();
     document.find_all("commentReference", &mut references);
@@ -81,6 +87,12 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
     let mut blocks = Blocks::new();
     let mut list = ListIndent::default();
     writer.blocks(body, &mut blocks, &mut list);
+    // Notes of ranges that ended after the last paragraph.
+    let trailing: String = std::mem::take(&mut writer.pending_notes)
+        .iter()
+        .map(|note| format!("{{>>{note}<<}}"))
+        .collect();
+    blocks.push(&trailing, false);
 
     // Footnotes and endnotes, numbered in reference order. A comment range the
     // body never closed does not run on into them.
@@ -417,13 +429,24 @@ struct Writer<'a> {
     note_refs: Vec<(bool, String)>,
     /// Tracked changes around the content being written, outermost first.
     revisions: Vec<Change>,
-    /// Comment id → the inside of its `{>>…<<}` note.
-    comments: HashMap<String, String>,
+    /// Comment id → its `w:comment` element.
+    comments: HashMap<String, Element>,
+    /// Comment id → the inside of its `{>>…<<}` note, rendered at first use so
+    /// that anything numbered inside it (a footnote) is numbered where the
+    /// comment is.
+    notes: HashMap<String, String>,
     /// Comments with a `commentReference`, where their note goes. Others get
     /// their note where their range ends.
     referenced: HashSet<String>,
     /// Comment ranges open at this point, in the order they started.
     open_comments: Vec<String>,
+    /// Notes of unreferenced comments whose range ended between paragraphs;
+    /// they open the next paragraph.
+    pending_notes: Vec<String>,
+    /// Writing a comment's own text, where a `{>>…<<}` cannot appear: tracked
+    /// changes keep their marks but not their author, and comment anchors are
+    /// ignored.
+    in_comment: bool,
 }
 
 impl Writer<'_> {
@@ -464,7 +487,7 @@ impl Writer<'_> {
     fn comment_range(&mut self, range: &Element, out: Option<&mut Critic>) {
         let Some(id) = range
             .attr("id")
-            .filter(|id| self.comments.contains_key(*id))
+            .filter(|id| !self.in_comment && self.comments.contains_key(*id))
         else {
             return;
         };
@@ -478,11 +501,17 @@ impl Writer<'_> {
             }
             (false, Some(at)) => {
                 self.open_comments.remove(at);
-                if let Some(out) = out {
-                    out.close(Mark::Highlight);
-                    if !self.referenced.contains(id) {
-                        out.comment(&self.comments[id]);
+                let note = (!self.referenced.contains(id))
+                    .then(|| self.note(id))
+                    .flatten();
+                match out {
+                    Some(out) => {
+                        out.close(Mark::Highlight);
+                        if let Some(note) = note {
+                            out.comment(&note);
+                        }
                     }
+                    None => self.pending_notes.extend(note),
                 }
             }
             _ => {}
@@ -535,7 +564,7 @@ impl Writer<'_> {
             list.reset();
             blocks.push(&block, false);
         }
-        blocks.set_separator(paragraph_mark(p).filter(|_| written && !boxed));
+        blocks.set_separator(self.paragraph_mark(p).filter(|_| written && !boxed));
     }
 
     /// The Markdown marker for a numbered paragraph, advancing Word's counters.
@@ -584,6 +613,11 @@ impl Writer<'_> {
             .map(|s| self.styles.emphasis(s))
             .unwrap_or((None, None));
         let base = (bold.unwrap_or(false), italic.unwrap_or(false));
+        if !self.in_comment {
+            for note in std::mem::take(&mut self.pending_notes) {
+                inline.comment(&note);
+            }
+        }
         for (mark, by) in &self.revisions {
             inline.open(*mark, by.as_deref());
         }
@@ -591,6 +625,9 @@ impl Writer<'_> {
             inline.open(Mark::Highlight, None);
         }
         self.inline(p, None, base, &mut fields, &mut inline, &mut extra);
+        if self.in_comment {
+            inline = inline.unattributed();
+        }
         (inline, extra)
     }
 
@@ -736,9 +773,9 @@ impl Writer<'_> {
                     out.raw(&format!("[^{number}]"));
                 }
             }
-            "commentReference" if !hidden => {
-                if let Some(note) = child.attr("id").and_then(|id| self.comments.get(id)) {
-                    out.comment(note);
+            "commentReference" if !hidden && !self.in_comment => {
+                if let Some(note) = child.attr("id").and_then(|id| self.note(id)) {
+                    out.comment(&note);
                 }
             }
             "drawing" | "pict" | "object" if !hidden => self.drawing(child, out, extra),
@@ -844,7 +881,7 @@ impl Writer<'_> {
             match child.local() {
                 "p" => {
                     let (inline, extra) = self.paragraph_inline(child);
-                    let mark = paragraph_mark(child).filter(|_| extra.is_empty());
+                    let mark = self.paragraph_mark(child).filter(|_| extra.is_empty());
                     parts.push((inline.into_inline().render(true), mark));
                     parts.extend(extra.into_iter().map(|block| (block, None)));
                 }
@@ -869,35 +906,37 @@ impl Writer<'_> {
         }
     }
 
-    /// Each comment's note, rendered before the body so that no tracked change
-    /// or comment range around its anchor leaks into it.
-    fn comment_notes(&mut self, root: &Element) -> HashMap<String, String> {
-        let mut notes = HashMap::new();
-        for comment in root.children_named("comment") {
-            let Some(id) = comment.attr("id") else {
-                continue;
-            };
-            let parts = comment
-                .children_named("p")
-                .map(|p| {
-                    let (inline, _) = self.paragraph_inline(p);
-                    (
-                        inline
-                            .unattributed()
-                            .into_inline()
-                            .render(true)
-                            .replace('\n', " "),
-                        paragraph_mark(p).map(|(mark, _)| (mark, None)),
-                    )
-                })
-                .collect();
-            let text = critic::join_marked(parts, " ");
-            notes.insert(
-                id.to_string(),
-                comment_note(comment.attr("author"), comment.attr("date"), &text),
-            );
+    /// The tracked change on a paragraph's mark, without its author inside a
+    /// comment's own text.
+    fn paragraph_mark(&self, p: &Element) -> Option<Change> {
+        paragraph_mark(p).map(|(mark, by)| (mark, by.filter(|_| !self.in_comment)))
+    }
+
+    /// A comment's note, rendered the first time it is needed. Its text is
+    /// written apart from the document around its anchor: no tracked change
+    /// or comment range there applies to it.
+    fn note(&mut self, id: &str) -> Option<String> {
+        if let Some(note) = self.notes.get(id) {
+            return Some(note.clone());
         }
-        notes
+        let comment = self.comments.get(id)?.clone();
+        let revisions = std::mem::take(&mut self.revisions);
+        let open_comments = std::mem::take(&mut self.open_comments);
+        self.in_comment = true;
+        let mut parts = Vec::new();
+        for p in comment.children_named("p") {
+            let (inline, extra) = self.paragraph_inline(p);
+            let mark = self.paragraph_mark(p).filter(|_| extra.is_empty());
+            parts.push((inline.into_inline().render(true), mark));
+            parts.extend(extra.into_iter().map(|block| (block, None)));
+        }
+        self.in_comment = false;
+        self.revisions = revisions;
+        self.open_comments = open_comments;
+        let text = critic::join_marked(parts, " ").replace('\n', " ");
+        let note = comment_note(comment.attr("author"), comment.attr("date"), &text);
+        self.notes.insert(id.to_string(), note.clone());
+        Some(note)
     }
 }
 
@@ -2210,6 +2249,122 @@ mod tests {
             "{--A--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}{--\n\n--}{>>Bo Chen (2026-09-29T15:10:00Z)<<}Next\n\n\
              {--B\n\nC--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}\n\n\
              |{++row++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}|{++{--cell--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}|\n|-|-|\n"
+        );
+    }
+
+    #[test]
+    fn footnotes_in_comment_text_are_numbered_where_the_comment_is() {
+        let body = [
+            p(
+                "",
+                r#"<w:r><w:t>B</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r>"#,
+            ),
+            p("", &format!("{}{}", r("A"), reference("1"))),
+        ]
+        .concat();
+        let footnotes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="2">{}</w:footnote><w:footnote w:id="3">{}</w:footnote></w:footnotes>"#,
+            p("", &r("body note")),
+            p("", &r("comment note")),
+        );
+        let xml = comments(&[(
+            "1",
+            "Ana",
+            "",
+            &p(
+                "",
+                r#"<w:r><w:t>see</w:t></w:r><w:r><w:footnoteReference w:id="3"/></w:r>"#,
+            ),
+        )]);
+        assert_eq!(
+            md(&docx(
+                &body,
+                &[
+                    ("word/comments.xml", &xml),
+                    ("word/footnotes.xml", &footnotes)
+                ]
+            )),
+            "B[^1]\n\nA{>>Ana: see[^2]<<}\n\n[^1]: body note\n[^2]: comment note\n"
+        );
+    }
+
+    #[test]
+    fn a_range_ending_between_paragraphs_keeps_its_note() {
+        let xml = comments(&[
+            ("1", "Ana", "", &p("", &r("first"))),
+            ("2", "Bo", "", &p("", &r("last"))),
+        ]);
+        let body = [
+            p("", &format!("{}{}", start("1"), r("a"))),
+            end("1"),
+            p("", &r("b")),
+            p("", &format!("{}{}", start("2"), r("c"))),
+            end("2"),
+        ]
+        .concat();
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==a==}\n\n{>>Ana: first<<}b\n\n{==c==}\n\n{>>Bo: last<<}\n"
+        );
+    }
+
+    #[test]
+    fn comment_text_keeps_text_boxes_without_nesting_comments() {
+        let inner = [
+            p(
+                "",
+                &by("ins", "Bo Chen", "2026-09-29T15:10:00Z", &r("boxed")),
+            ),
+            p("", &format!("{}{}", r("with a note"), reference("2"))),
+        ]
+        .concat();
+        let text = p(
+            "",
+            &format!("{}{}{}", r("see "), text_box(&inner), reference("2")),
+        );
+        let xml = comments(&[
+            ("1", "Ana", "", &text),
+            ("2", "Bo", "", &p("", &r("inner"))),
+        ]);
+        let body = p(
+            "",
+            &format!("{}{}{}{}", start("1"), r("x"), end("1"), reference("1")),
+        );
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==x==}{>>Ana: see {++boxed++} with a note<<}\n"
+        );
+    }
+
+    #[test]
+    fn a_comment_used_twice_is_written_once_and_its_footnote_counted_once() {
+        let body = [
+            p("", &format!("{}{}", r("A"), reference("1"))),
+            p("", &format!("{}{}", r("B"), reference("1"))),
+        ]
+        .concat();
+        let footnotes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="3">{}</w:footnote></w:footnotes>"#,
+            p("", &r("source")),
+        );
+        let xml = comments(&[(
+            "1",
+            "Ana",
+            "",
+            &p(
+                "",
+                r#"<w:r><w:t>see</w:t></w:r><w:r><w:footnoteReference w:id="3"/></w:r>"#,
+            ),
+        )]);
+        assert_eq!(
+            md(&docx(
+                &body,
+                &[
+                    ("word/comments.xml", &xml),
+                    ("word/footnotes.xml", &footnotes)
+                ]
+            )),
+            "A{>>Ana: see[^1]<<}\n\nB{>>Ana: see[^1]<<}\n\n[^1]: source\n"
         );
     }
 
