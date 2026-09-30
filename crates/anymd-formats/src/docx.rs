@@ -1,8 +1,10 @@
-//! DOCX → Markdown: headings, emphasis, links, lists, tables, footnotes.
+//! DOCX → Markdown: headings, emphasis, links, lists, tables, footnotes, and
+//! tracked changes and comments as CriticMarkup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ooxml::{self, Blocks, Element, Inline, ListIndent, Package, Rels};
+use crate::critic::{self, Critic, Mark};
+use crate::ooxml::{self, Blocks, Element, ListIndent, Package, Rels};
 use crate::{markdown_table, ConvertError, Converted, Options, Section};
 
 pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertError> {
@@ -44,6 +46,10 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
             }
         }
     }
+    let comments = package
+        .xml(&part("/comments", "word/comments.xml"))
+        .ok()
+        .flatten();
     let (title, metadata) = ooxml::core_properties(&mut package);
 
     let mut writer = Writer {
@@ -53,13 +59,32 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
         counters: HashMap::new(),
         started_nums: Vec::new(),
         note_refs: Vec::new(),
+        revisions: Vec::new(),
+        comments: HashMap::new(),
+        referenced: HashSet::new(),
+        open_comments: Vec::new(),
     };
+    if let Some(root) = &comments {
+        writer.comments = writer.comment_notes(root);
+    }
+    let mut references = Vec::new();
+    document.find_all("commentReference", &mut references);
+    for note in notes.values() {
+        note.find_all("commentReference", &mut references);
+    }
+    writer.referenced = references
+        .iter()
+        .filter_map(|r| r.attr("id"))
+        .map(str::to_string)
+        .collect();
     let body = document.child("body").unwrap_or(&document);
     let mut blocks = Blocks::new();
     let mut list = ListIndent::default();
     writer.blocks(body, &mut blocks, &mut list);
 
-    // Footnotes and endnotes, numbered in reference order.
+    // Footnotes and endnotes, numbered in reference order. A comment range the
+    // body never closed does not run on into them.
+    writer.open_comments.clear();
     let mut index = 0;
     let mut defs = Vec::new();
     while index < writer.note_refs.len() {
@@ -68,16 +93,19 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
         let Some(note) = notes.get(&key) else {
             continue;
         };
-        let text: Vec<String> = note
+        let parts = note
             .children_named("p")
             .map(|p| {
                 let (inline, _) = writer.paragraph_inline(p);
-                inline.render(true).replace('\n', " ")
+                (
+                    inline.into_inline().render(true).replace('\n', " "),
+                    paragraph_mark(p),
+                )
             })
-            .filter(|t| !t.trim().is_empty())
             .collect();
+        let text = critic::join_marked(parts, " ");
         if !text.is_empty() {
-            defs.push(format!("[^{index}]: {}", text.join(" ")));
+            defs.push(format!("[^{index}]: {text}"));
         }
     }
     let mut markdown = blocks.finish();
@@ -315,21 +343,60 @@ struct Field {
     link: Option<String>,
 }
 
-/// How Word represents tracked changes in WordprocessingML. Moves are rendered
-/// as an insertion at their destination and a deletion at their source, which
-/// is the same lossless representation used by CriticMarkup (and pandiff).
-#[derive(Clone, Copy)]
-enum Revision {
-    Insertion,
-    Deletion,
+/// Insertions and move destinations are insertions; deletions and move sources
+/// are deletions (the representation pandiff uses too).
+fn mark_of(name: &str) -> Mark {
+    if matches!(name, "ins" | "moveTo") {
+        Mark::Insertion
+    } else {
+        Mark::Deletion
+    }
 }
 
-impl Revision {
-    fn markers(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Insertion => ("{++", "++}"),
-            Self::Deletion => ("{--", "--}"),
-        }
+/// Tracked changes recorded in a properties element (`trPr`, `tcPr`, a
+/// paragraph mark's `rPr`), in document order.
+fn revision_marks(properties: &Element) -> Vec<Mark> {
+    properties
+        .elements()
+        .filter_map(|p| match p.local() {
+            "ins" | "moveTo" | "cellIns" => Some(Mark::Insertion),
+            "del" | "moveFrom" | "cellDel" => Some(Mark::Deletion),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The tracked change on the mark that ends a paragraph, that is on the break
+/// between it and the next one. A mark inserted and then deleted counts as
+/// deleted, the later of the two changes.
+fn paragraph_mark(p: &Element) -> Option<Mark> {
+    let marks = p
+        .path(&["pPr", "rPr"])
+        .map(revision_marks)
+        .unwrap_or_default();
+    if marks.contains(&Mark::Deletion) {
+        Some(Mark::Deletion)
+    } else {
+        marks.first().copied()
+    }
+}
+
+/// A comment's `{>>…<<}` text: `Author (date): comment`. The date is Word's
+/// `w:date` exactly as stored (for example `2024-04-08T10:32:00Z`, which Word
+/// writes as the author's local time with a `Z`), so it is never converted.
+fn comment_note(author: Option<&str>, date: Option<&str>, text: &str) -> String {
+    let mut head = Vec::new();
+    if let Some(author) = author.map(str::trim).filter(|a| !a.is_empty()) {
+        head.push(critic::escape(author));
+    }
+    if let Some(date) = date.map(str::trim).filter(|d| !d.is_empty()) {
+        head.push(format!("({})", critic::escape(date)));
+    }
+    let head = head.join(" ");
+    match (head.is_empty(), text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => head,
+        (false, false) => format!("{head}: {text}"),
     }
 }
 
@@ -342,54 +409,81 @@ struct Writer<'a> {
     started_nums: Vec<String>,
     /// (is_endnote, id) in first-reference order.
     note_refs: Vec<(bool, String)>,
+    /// Tracked changes around the content being written, outermost first.
+    revisions: Vec<Mark>,
+    /// Comment id → the inside of its `{>>…<<}` note.
+    comments: HashMap<String, String>,
+    /// Comments with a `commentReference`, where their note goes. Others get
+    /// their note where their range ends.
+    referenced: HashSet<String>,
+    /// Comment ranges open at this point, in the order they started.
+    open_comments: Vec<String>,
 }
 
 impl Writer<'_> {
     fn blocks(&mut self, container: &Element, blocks: &mut Blocks, list: &mut ListIndent) {
-        self.blocks_revised(container, blocks, list, None);
-    }
-
-    fn blocks_revised(
-        &mut self,
-        container: &Element,
-        blocks: &mut Blocks,
-        list: &mut ListIndent,
-        revision: Option<Revision>,
-    ) {
         for child in container.elements() {
             match child.local() {
-                "p" => self.paragraph(child, blocks, list, revision),
+                "p" => self.paragraph(child, blocks, list),
                 "tbl" => {
                     list.reset();
-                    let table = self.table(child, revision);
+                    let table = self.table(child);
                     blocks.push(&table, false);
                 }
                 "sdt" => {
                     if let Some(content) = child.child("sdtContent") {
-                        self.blocks_revised(content, blocks, list, revision);
+                        self.blocks(content, blocks, list);
                     }
                 }
-                "ins" | "moveTo" => {
-                    self.blocks_revised(child, blocks, list, revision.or(Some(Revision::Insertion)))
+                "ins" | "moveTo" | "del" | "moveFrom" => {
+                    self.revised(mark_of(child.local()), |w| w.blocks(child, blocks, list));
                 }
-                "del" | "moveFrom" => {
-                    self.blocks_revised(child, blocks, list, revision.or(Some(Revision::Deletion)))
-                }
-                "customXml" | "sdtContent" | "txbxContent" => {
-                    self.blocks_revised(child, blocks, list, revision)
-                }
+                "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, None),
+                "customXml" | "sdtContent" | "txbxContent" => self.blocks(child, blocks, list),
                 _ => {}
             }
         }
     }
 
-    fn paragraph(
-        &mut self,
-        p: &Element,
-        blocks: &mut Blocks,
-        list: &mut ListIndent,
-        revision: Option<Revision>,
-    ) {
+    /// Writes content inside a tracked change.
+    fn revised(&mut self, mark: Mark, write: impl FnOnce(&mut Self)) {
+        self.revisions.push(mark);
+        write(self);
+        self.revisions.pop();
+    }
+
+    /// A comment range start or end. The commented text is highlighted; a range
+    /// that spans paragraphs gets one highlight per paragraph, because
+    /// CriticMarkup cannot cross a block.
+    fn comment_range(&mut self, range: &Element, out: Option<&mut Critic>) {
+        let Some(id) = range
+            .attr("id")
+            .filter(|id| self.comments.contains_key(*id))
+        else {
+            return;
+        };
+        let open = self.open_comments.iter().position(|open| open == id);
+        match (range.is("commentRangeStart"), open) {
+            (true, None) => {
+                self.open_comments.push(id.to_string());
+                if let Some(out) = out {
+                    out.open(Mark::Highlight);
+                }
+            }
+            (false, Some(at)) => {
+                self.open_comments.remove(at);
+                if let Some(out) = out {
+                    out.close(Mark::Highlight);
+                    if !self.referenced.contains(id) {
+                        out.comment(&self.comments[id]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paragraph(&mut self, p: &Element, blocks: &mut Blocks, list: &mut ListIndent) {
         let ppr = p.child("pPr");
         let style = ppr
             .and_then(|pr| pr.child("pStyle"))
@@ -410,27 +504,32 @@ impl Writer<'_> {
             .or_else(|| style.as_deref().and_then(|s| self.styles.num(s)));
 
         let (inline, extra) = self.paragraph_inline(p);
-        if !inline.is_blank() {
+        let written = !inline.is_blank();
+        if written {
+            let inline = inline.into_inline();
             if let Some(level) = heading {
                 list.reset();
-                let text = mark_revision(inline.render(false).replace('\n', " "), revision);
-                blocks.push(&format!("{} {text}", "#".repeat(level)), false);
+                let text = inline.render(false).replace('\n', " ");
+                blocks.push_prefixed(&format!("{} ", "#".repeat(level)), &text, false);
             } else if let Some(marker) =
                 num.and_then(|(id, ilvl)| self.list_marker(&id, ilvl.min(8)).map(|m| (m, ilvl)))
             {
                 let (marker, ilvl) = marker;
-                let text = mark_revision(inline.render(true), revision);
-                let item = list.item(ilvl, &marker, &text);
-                blocks.push(&item, true);
+                let item = list.item(ilvl, &marker, &inline.render(true));
+                let prefix = item.len() - item.trim_start().len() + marker.len() + 1;
+                blocks.push_prefixed(&item[..prefix], &item[prefix..], true);
             } else {
                 list.reset();
-                blocks.push(&mark_revision(inline.render(true), revision), false);
+                blocks.push_prefixed("", &inline.render(true), false);
             }
         }
+        // A text box between this paragraph and the next one takes the break.
+        let boxed = !extra.is_empty();
         for block in extra {
             list.reset();
             blocks.push(&block, false);
         }
+        blocks.set_separator(paragraph_mark(p).filter(|_| written && !boxed));
     }
 
     /// The Markdown marker for a numbered paragraph, advancing Word's counters.
@@ -467,8 +566,10 @@ impl Writer<'_> {
     }
 
     /// Inline content of a paragraph plus any text-box blocks found inside it.
-    fn paragraph_inline(&mut self, p: &Element) -> (Inline, Vec<String>) {
-        let mut inline = Inline::default();
+    /// Tracked changes around the paragraph and comment ranges still open from
+    /// earlier paragraphs are opened again at its start.
+    fn paragraph_inline(&mut self, p: &Element) -> (Critic, Vec<String>) {
+        let mut inline = Critic::default();
         let mut extra = Vec::new();
         let mut fields = Vec::new();
         let (bold, italic) = p
@@ -477,6 +578,12 @@ impl Writer<'_> {
             .map(|s| self.styles.emphasis(s))
             .unwrap_or((None, None));
         let base = (bold.unwrap_or(false), italic.unwrap_or(false));
+        for &mark in &self.revisions {
+            inline.open(mark);
+        }
+        for _ in &self.open_comments {
+            inline.open(Mark::Highlight);
+        }
         self.inline(p, None, base, &mut fields, &mut inline, &mut extra);
         (inline, extra)
     }
@@ -487,7 +594,7 @@ impl Writer<'_> {
         link: Option<&str>,
         base: (bool, bool),
         fields: &mut Vec<Field>,
-        out: &mut Inline,
+        out: &mut Critic,
         extra: &mut Vec<String>,
     ) {
         for child in container.elements() {
@@ -501,12 +608,13 @@ impl Writer<'_> {
                     let url = child.attr("instr").and_then(hyperlink_instruction);
                     self.inline(child, url.as_deref().or(link), base, fields, out, extra);
                 }
-                "ins" | "moveTo" => {
-                    self.revision_inline(child, Revision::Insertion, link, base, fields, out, extra)
+                "ins" | "moveTo" | "del" | "moveFrom" => {
+                    let mark = mark_of(child.local());
+                    out.open(mark);
+                    self.revised(mark, |w| w.inline(child, link, base, fields, out, extra));
+                    out.close(mark);
                 }
-                "del" | "moveFrom" => {
-                    self.revision_inline(child, Revision::Deletion, link, base, fields, out, extra)
-                }
+                "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, Some(out)),
                 "smartTag" | "customXml" | "sdt" | "sdtContent" | "bdo" | "dir" => {
                     self.inline(child, link, base, fields, out, extra)
                 }
@@ -517,40 +625,18 @@ impl Writer<'_> {
                         .filter(|m| !m.is_empty())
                         .collect();
                     if !equations.is_empty() {
-                        out.push(
-                            &format!("$${}$$", equations.join(" \\\\ ")),
-                            false,
-                            false,
-                            None,
-                        );
+                        out.raw(&format!("$${}$$", equations.join(" \\\\ ")));
                     }
                 }
                 "oMath" => {
                     let latex = math(child);
                     if !latex.is_empty() {
-                        out.push(&format!("${latex}$"), false, false, None);
+                        out.raw(&format!("${latex}$"));
                     }
                 }
                 _ => {}
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn revision_inline(
-        &mut self,
-        container: &Element,
-        revision: Revision,
-        link: Option<&str>,
-        base: (bool, bool),
-        fields: &mut Vec<Field>,
-        out: &mut Inline,
-        extra: &mut Vec<String>,
-    ) {
-        let (open, close) = revision.markers();
-        out.push(open, false, false, None);
-        self.inline(container, link, base, fields, out, extra);
-        out.push(close, false, false, None);
     }
 
     fn run(
@@ -559,7 +645,7 @@ impl Writer<'_> {
         link: Option<&str>,
         base: (bool, bool),
         fields: &mut Vec<Field>,
-        out: &mut Inline,
+        out: &mut Critic,
         extra: &mut Vec<String>,
     ) {
         let rpr = run.child("rPr");
@@ -590,7 +676,7 @@ impl Writer<'_> {
         link: Option<&str>,
         (bold, italic): (bool, bool),
         fields: &mut Vec<Field>,
-        out: &mut Inline,
+        out: &mut Critic,
         extra: &mut Vec<String>,
     ) {
         let hidden = fields.iter().any(|f| !f.in_result);
@@ -605,7 +691,7 @@ impl Writer<'_> {
                 }
             }
             "noBreakHyphen" if !hidden => out.push("-", bold, italic, link),
-            "instrText" => {
+            "instrText" | "delInstrText" => {
                 if let Some(field) = fields.last_mut() {
                     if !field.in_result {
                         field.instruction.push_str(&child.text());
@@ -639,7 +725,12 @@ impl Writer<'_> {
                             self.note_refs.len()
                         }
                     };
-                    out.push(&format!("[^{number}]"), false, false, None);
+                    out.raw(&format!("[^{number}]"));
+                }
+            }
+            "commentReference" if !hidden => {
+                if let Some(note) = child.attr("id").and_then(|id| self.comments.get(id)) {
+                    out.comment(note);
                 }
             }
             "drawing" | "pict" | "object" if !hidden => self.drawing(child, out, extra),
@@ -654,16 +745,20 @@ impl Writer<'_> {
         }
     }
 
-    /// Images with alt text become `![alt](name)`; text boxes become extra blocks.
-    fn drawing(&mut self, drawing: &Element, out: &mut Inline, extra: &mut Vec<String>) {
+    /// Images with alt text become `![alt](name)`; text boxes become extra blocks,
+    /// inside any tracked change around the drawing. A text box is a story of
+    /// its own, so comment ranges around its anchor do not cover it.
+    fn drawing(&mut self, drawing: &Element, out: &mut Critic, extra: &mut Vec<String>) {
         let mut boxes = Vec::new();
         drawing.find_all("txbxContent", &mut boxes);
+        let open_comments = std::mem::take(&mut self.open_comments);
         for content in boxes {
             let mut blocks = Blocks::new();
             let mut list = ListIndent::default();
             self.blocks(content, &mut blocks, &mut list);
             extra.push(blocks.finish());
         }
+        self.open_comments = open_comments;
         if let Some(doc_pr) = drawing.find("docPr") {
             let alt = doc_pr
                 .attr("descr")
@@ -676,16 +771,16 @@ impl Writer<'_> {
                 .and_then(|id| self.rels.get(id))
                 .map(|r| r.target.clone());
             if let Some(image) = ooxml::image_markdown(alt, target.as_deref()) {
-                out.push(&image, false, false, None);
+                out.raw(&image);
             }
         }
     }
 
-    fn table(&mut self, table: &Element, revision: Option<Revision>) -> String {
+    fn table(&mut self, table: &Element) -> String {
         let mut rows = Vec::new();
         for tr in table_rows(table) {
             let mut row = Vec::new();
-            let row_revision = tr.child("trPr").and_then(revision_property);
+            let row_marks = tr.child("trPr").map(revision_marks).unwrap_or_default();
             let before = tr
                 .path(&["trPr", "gridBefore"])
                 .and_then(|g| g.attr("val"))
@@ -693,11 +788,7 @@ impl Writer<'_> {
                 .unwrap_or(0);
             row.extend(std::iter::repeat_n(String::new(), before.min(64)));
             for tc in row_cells(tr) {
-                let cell_revision = tc.child("tcPr").and_then(revision_property);
-                row.push(mark_revision(
-                    self.cell_text(tc),
-                    cell_revision.or(row_revision).or(revision),
-                ));
+                row.push(self.cell_text(&row_marks, tc));
                 let span = tc
                     .path(&["tcPr", "gridSpan"])
                     .and_then(|g| g.attr("val"))
@@ -725,75 +816,76 @@ impl Writer<'_> {
         markdown_table(&rows)
     }
 
-    fn cell_text(&mut self, cell: &Element) -> String {
+    /// A cell's paragraphs joined with `<br>`, inside the tracked changes of its
+    /// row (`trPr`) and of the cell itself (`tcPr`).
+    fn cell_text(&mut self, row_marks: &[Mark], cell: &Element) -> String {
+        let depth = self.revisions.len();
+        self.revisions.extend_from_slice(row_marks);
+        if let Some(properties) = cell.child("tcPr") {
+            self.revisions.extend(revision_marks(properties));
+        }
         let mut parts = Vec::new();
         self.cell_parts(cell, &mut parts);
-        parts.retain(|p| !p.trim().is_empty());
-        parts.join("<br>").replace('\n', "<br>")
+        self.revisions.truncate(depth);
+        critic::join_marked(parts, "<br>").replace('\n', "<br>")
     }
 
-    fn cell_parts(&mut self, container: &Element, parts: &mut Vec<String>) {
+    /// Paragraph texts in a cell, each with the tracked change on its mark.
+    fn cell_parts(&mut self, container: &Element, parts: &mut Vec<(String, Option<Mark>)>) {
         for child in container.elements() {
             match child.local() {
                 "p" => {
                     let (inline, extra) = self.paragraph_inline(child);
-                    parts.push(inline.render(true));
-                    parts.extend(extra);
+                    let mark = paragraph_mark(child).filter(|_| extra.is_empty());
+                    parts.push((inline.into_inline().render(true), mark));
+                    parts.extend(extra.into_iter().map(|block| (block, None)));
                 }
                 "tbl" => {
                     // Nested tables are flattened to text, one row per line.
                     for tr in table_rows(child) {
+                        let row_marks = tr.child("trPr").map(revision_marks).unwrap_or_default();
                         let cells: Vec<String> = row_cells(tr)
-                            .map(|tc| self.cell_text(tc))
+                            .map(|tc| self.cell_text(&row_marks, tc))
                             .filter(|t| !t.is_empty())
                             .collect();
-                        parts.push(cells.join("; "));
+                        parts.push((cells.join("; "), None));
                     }
                 }
-                "ins" | "moveTo" => {
-                    let start = parts.len();
-                    self.cell_parts(child, parts);
-                    mark_parts(parts, start, Revision::Insertion);
+                "ins" | "moveTo" | "del" | "moveFrom" => {
+                    self.revised(mark_of(child.local()), |w| w.cell_parts(child, parts));
                 }
-                "del" | "moveFrom" => {
-                    let start = parts.len();
-                    self.cell_parts(child, parts);
-                    mark_parts(parts, start, Revision::Deletion);
-                }
+                "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, None),
                 "sdt" | "sdtContent" | "customXml" => self.cell_parts(child, parts),
                 _ => {}
             }
         }
     }
-}
 
-fn mark_revision(text: String, revision: Option<Revision>) -> String {
-    let Some(revision) = revision else {
-        return text;
-    };
-    if text.trim().is_empty() {
-        return text;
-    }
-    let (open, close) = revision.markers();
-    format!("{open}{text}{close}")
-}
-
-fn mark_parts(parts: &mut Vec<String>, start: usize, revision: Revision) {
-    if start >= parts.len() {
-        return;
-    }
-    let (open, close) = revision.markers();
-    parts[start].insert_str(0, open);
-    parts.last_mut().expect("a part was added").push_str(close);
-}
-
-fn revision_property(properties: &Element) -> Option<Revision> {
-    if properties.child("del").is_some() || properties.child("cellDel").is_some() {
-        Some(Revision::Deletion)
-    } else if properties.child("ins").is_some() || properties.child("cellIns").is_some() {
-        Some(Revision::Insertion)
-    } else {
-        None
+    /// Each comment's note, rendered before the body so that no tracked change
+    /// or comment range around its anchor leaks into it.
+    fn comment_notes(&mut self, root: &Element) -> HashMap<String, String> {
+        let mut notes = HashMap::new();
+        for comment in root.children_named("comment") {
+            let Some(id) = comment.attr("id") else {
+                continue;
+            };
+            let parts = comment
+                .children_named("p")
+                .map(|p| {
+                    let (inline, _) = self.paragraph_inline(p);
+                    (
+                        inline.into_inline().render(true).replace('\n', " "),
+                        paragraph_mark(p),
+                    )
+                })
+                .collect();
+            let text = critic::join_marked(parts, " ");
+            notes.insert(
+                id.to_string(),
+                comment_note(comment.attr("author"), comment.attr("date"), &text),
+            );
+        }
+        notes
     }
 }
 
@@ -1229,9 +1321,11 @@ mod tests {
         ]
         .concat();
 
+        // A deletion next to an insertion is a replacement: CriticMarkup's
+        // substitution, as pandiff writes it.
         assert_eq!(
             md(&docx(&body, &[])),
-            "Keep {--_old_--}{++**new**++}.\n\n{++destination++} / {--source--}\n"
+            "Keep {~~_old_~>**new**~~}.\n\n{++destination++} / {--source--}\n"
         );
     }
 
@@ -1259,9 +1353,676 @@ mod tests {
             p("", &r("new")),
         );
 
+        // The inserted cell sits in a deleted row: accepting removes the row and
+        // rejecting removes the cell, so the text is gone either way.
         assert_eq!(
             md(&docx(&body, &[])),
-            "|Before|After|\n|-|-|\n|{--old--}|{++new++}|\n"
+            "|Before|After|\n|-|-|\n|{--old--}|{--{++new++}--}|\n"
+        );
+    }
+
+    // Tracked-change building blocks, written the way Word writes them.
+    fn ins(content: &str) -> String {
+        format!(
+            r#"<w:ins w:id="90" w:author="Ana" w:date="2026-01-02T03:04:00Z">{content}</w:ins>"#
+        )
+    }
+
+    fn del(content: &str) -> String {
+        format!(
+            r#"<w:del w:id="91" w:author="Ana" w:date="2026-01-02T03:04:00Z">{content}</w:del>"#
+        )
+    }
+
+    fn dr(text: &str) -> String {
+        format!(r#"<w:r><w:delText xml:space="preserve">{text}</w:delText></w:r>"#)
+    }
+
+    /// A paragraph whose mark (the break after it) carries `mark` (`ins`, `del`,
+    /// `moveFrom`, `moveTo`, or several), with an optional style.
+    fn pm(style: &str, marks: &[&str], runs: &str) -> String {
+        let style = if style.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<w:pStyle w:val="{style}"/>"#)
+        };
+        let marks: String = marks
+            .iter()
+            .map(|m| format!(r#"<w:{m} w:id="92" w:author="Ana" w:date="2026-01-02T03:04:00Z"/>"#))
+            .collect();
+        format!("<w:p><w:pPr>{style}<w:rPr>{marks}</w:rPr></w:pPr>{runs}</w:p>")
+    }
+
+    fn text_box(inner: &str) -> String {
+        format!(
+            r#"<w:r><w:drawing><wp:anchor xmlns:wp="wp"><wp:docPr id="7" name="Text Box 7"/><a:graphic xmlns:a="a"><a:graphicData><wps:wsp xmlns:wps="wps"><wps:txbx><w:txbxContent>{inner}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>"#
+        )
+    }
+
+    #[test]
+    fn review_deleted_row_with_deleted_runs_is_marked_once() {
+        // Word deletes a row by marking the row, every run and every paragraph mark.
+        let body = format!(
+            r#"<w:tbl><w:tr><w:tc>{}</w:tc></w:tr><w:tr><w:trPr><w:del w:id="1" w:author="Ana" w:date="2026-01-02T03:04:00Z"/></w:trPr><w:tc>{}</w:tc></w:tr></w:tbl>"#,
+            p("", &r("Head")),
+            pm("", &["del"], &del(&dr("old"))),
+        );
+        assert_eq!(md(&docx(&body, &[])), "|Head|\n|-|\n|{--old--}|\n");
+    }
+
+    #[test]
+    fn review_text_box_inside_a_tracked_change_keeps_the_change() {
+        let body = [
+            p("", &del(&text_box(&p("", &r("Deleted box"))))),
+            p(
+                "",
+                &format!("{}{}", r("Keep"), ins(&text_box(&p("", &r("Added box"))))),
+            ),
+        ]
+        .concat();
+        // The deleted box leaves no empty `{----}` paragraph behind.
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "{--Deleted box--}\n\nKeep\n\n{++Added box++}\n"
+        );
+    }
+
+    #[test]
+    fn review_tracked_paragraph_marks_mark_the_break() {
+        let deleted = [pm("", &["del"], &r("A")), p("", &r("B"))].concat();
+        assert_eq!(md(&docx(&deleted, &[])), "A{--\n\n--}B\n");
+        let inserted = [pm("", &["ins"], &r("A")), p("", &r("B"))].concat();
+        assert_eq!(md(&docx(&inserted, &[])), "A{++\n\n++}B\n");
+        // A whole deleted paragraph: its text and its break are one deletion.
+        let whole = [
+            pm("", &["del"], &del(&dr("Deleted paragraph"))),
+            p("", &r("Next")),
+        ]
+        .concat();
+        assert_eq!(md(&docx(&whole, &[])), "{--Deleted paragraph\n\n--}Next\n");
+    }
+
+    #[test]
+    fn review_footnote_revisions_are_marked() {
+        let body = p(
+            "",
+            r#"<w:r><w:t>Claim</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r>"#,
+        );
+        let footnotes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="2">{}{}</w:footnote></w:footnotes>"#,
+            pm(
+                "",
+                &["del"],
+                &format!("{}{}", r("Source"), ins(&r(" updated")))
+            ),
+            p("", &r("page 4")),
+        );
+        assert_eq!(
+            md(&docx(&body, &[("word/footnotes.xml", &footnotes)])),
+            "Claim[^1]\n\n[^1]: Source{++ updated++}{-- --}page 4\n"
+        );
+    }
+
+    /// `word/comments.xml` with one `w:comment` per entry: (id, author, date,
+    /// paragraphs). An empty author or date leaves the attribute out.
+    fn comments(entries: &[(&str, &str, &str, &str)]) -> String {
+        let body: String = entries
+            .iter()
+            .map(|(id, author, date, paragraphs)| {
+                let author = if author.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#" w:author="{author}""#)
+                };
+                let date = if date.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#" w:date="{date}""#)
+                };
+                format!(r#"<w:comment w:id="{id}"{author}{date} w:initials="X">{paragraphs}</w:comment>"#)
+            })
+            .collect();
+        format!(r#"<w:comments {W}>{body}</w:comments>"#)
+    }
+
+    fn start(id: &str) -> String {
+        format!(r#"<w:commentRangeStart w:id="{id}"/>"#)
+    }
+
+    fn end(id: &str) -> String {
+        format!(r#"<w:commentRangeEnd w:id="{id}"/>"#)
+    }
+
+    /// The reference run Word writes right after a comment's range end.
+    fn reference(id: &str) -> String {
+        format!(
+            r#"<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="{id}"/></w:r>"#
+        )
+    }
+
+    fn with_comments(body: &str, xml: &str) -> String {
+        md(&docx(body, &[("word/comments.xml", xml)]))
+    }
+
+    const BILL: (&str, &str) = ("Bill Winter", "2024-04-08T10:32:00Z");
+
+    #[test]
+    fn comment_highlights_its_range_and_names_author_and_date_as_word_stores_them() {
+        let body = p(
+            "",
+            &format!(
+                "{}{}{}{}{}{}",
+                r("Truth is "),
+                start("0"),
+                r("stranger than fiction"),
+                end("0"),
+                reference("0"),
+                r(".")
+            ),
+        );
+        let xml = comments(&[("0", BILL.0, BILL.1, &p("", &r("true")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "Truth is {==stranger than fiction==}{>>Bill Winter (2024-04-08T10:32:00Z): true<<}.\n"
+        );
+    }
+
+    #[test]
+    fn comment_date_is_copied_verbatim_whatever_its_form() {
+        // Fractional seconds and offsets are valid xsd:dateTime; they are kept.
+        for date in [
+            "2024-04-08T10:32:17.123Z",
+            "2024-04-08T10:32:00+02:00",
+            "2024-04-08T10:32:00",
+        ] {
+            let body = p("", &format!("{}{}", r("a"), reference("1")));
+            let xml = comments(&[("1", "Ana", date, &p("", &r("n")))]);
+            assert_eq!(
+                with_comments(&body, &xml),
+                format!("a{{>>Ana ({date}): n<<}}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn comment_note_leaves_out_what_is_missing() {
+        assert_eq!(
+            comment_note(Some("Ana"), Some("2026-01-02T03:04:00Z"), "hi"),
+            "Ana (2026-01-02T03:04:00Z): hi"
+        );
+        assert_eq!(comment_note(Some("Ana"), None, "hi"), "Ana: hi");
+        assert_eq!(
+            comment_note(None, Some("2026-01-02T03:04:00Z"), "hi"),
+            "(2026-01-02T03:04:00Z): hi"
+        );
+        assert_eq!(comment_note(Some("  "), Some(" "), "hi"), "hi");
+        assert_eq!(
+            comment_note(Some("Ana"), Some("2026-01-02T03:04:00Z"), ""),
+            "Ana (2026-01-02T03:04:00Z)"
+        );
+        assert_eq!(comment_note(None, None, ""), "");
+        assert_eq!(comment_note(Some("A <<} B"), None, "x"), "A <<\\} B: x");
+    }
+
+    #[test]
+    fn comment_without_a_range_is_a_plain_comment_at_its_reference() {
+        let body = p(
+            "",
+            &format!(
+                "{}{}{}",
+                r("Lorem ipsum dolor sit amet."),
+                reference("3"),
+                r(" Next")
+            ),
+        );
+        let xml = comments(&[("3", "Ana", "", &p("", &r("This is a comment")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "Lorem ipsum dolor sit amet.{>>Ana: This is a comment<<} Next\n"
+        );
+    }
+
+    #[test]
+    fn replies_and_overlapping_ranges_share_one_highlight() {
+        // Word writes a reply as its own comment over the same range.
+        let body = p(
+            "",
+            &[
+                start("0"),
+                r("a"),
+                start("1"),
+                start("2"),
+                r("b"),
+                end("0"),
+                reference("0"),
+                r("c"),
+                end("1"),
+                reference("1"),
+                end("2"),
+                reference("2"),
+            ]
+            .concat(),
+        );
+        let xml = comments(&[
+            ("0", "Ana", "2026-01-01T09:00:00Z", &p("", &r("first"))),
+            ("1", "Bo", "2026-01-01T10:00:00Z", &p("", &r("second"))),
+            ("2", "Ana", "2026-01-01T11:00:00Z", &p("", &r("reply"))),
+        ]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==abc==}{>>Ana (2026-01-01T09:00:00Z): first<<}{>>Bo (2026-01-01T10:00:00Z): second<<}{>>Ana (2026-01-01T11:00:00Z): reply<<}\n"
+        );
+    }
+
+    #[test]
+    fn comment_range_across_paragraphs_highlights_each_paragraph() {
+        let body = [
+            p("", &format!("{}{}{}", r("one "), start("5"), r("two"))),
+            p("Heading1", &r("three")),
+            p(
+                "",
+                &format!("{}{}{}{}", r("four"), end("5"), reference("5"), r(" five")),
+            ),
+        ]
+        .concat();
+        let xml = comments(&[("5", "Ana", "", &p("", &r("long")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "one {==two==}\n\n# {==three==}\n\n{==four==}{>>Ana: long<<} five\n"
+        );
+    }
+
+    #[test]
+    fn comment_ranges_at_block_level_and_in_tables() {
+        let body = format!(
+            "{}{}<w:tbl><w:tr><w:tc>{}{}</w:tc></w:tr></w:tbl>{}",
+            start("1"),
+            p("", &r("para")),
+            p("", &r("cell")),
+            end("1"),
+            p("", &format!("{}{}", r("after"), reference("1"))),
+        );
+        let xml = comments(&[("1", "Ana", "", &p("", &r("n")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==para==}\n\n|{==cell==}|\n|-|\n\nafter{>>Ana: n<<}\n"
+        );
+    }
+
+    #[test]
+    fn comment_without_a_reference_gets_its_note_at_the_range_end() {
+        let body = p(
+            "",
+            &format!("{}{}{}{}", start("4"), r("x"), end("4"), r("y")),
+        );
+        let xml = comments(&[("4", "Ana", "", &p("", &r("n")))]);
+        assert_eq!(with_comments(&body, &xml), "{==x==}{>>Ana: n<<}y\n");
+    }
+
+    #[test]
+    fn unknown_or_malformed_comments_are_ignored() {
+        let body = p(
+            "",
+            &format!(
+                "{}{}{}{}{}{}{}",
+                start("9"),
+                r("a"),
+                end("9"),
+                reference("9"),
+                end("8"),
+                r("b"),
+                r#"<w:commentRangeStart/><w:r><w:commentReference/></w:r>"#,
+            ),
+        );
+        // Without a comments part every anchor is ignored.
+        assert_eq!(md(&docx(&body, &[])), "ab\n");
+        // A comment without an id cannot be referenced; one never closed stays a
+        // highlight to the end of its paragraph only.
+        let xml = format!(
+            r#"<w:comments {W}><w:comment w:author="Ana">{}</w:comment><w:comment w:id="8" w:author="Ana">{}</w:comment></w:comments>"#,
+            p("", &r("x")),
+            p("", &r("y"))
+        );
+        let open = [
+            p("", &format!("{}{}", start("8"), r("open"))),
+            p("", &r("still")),
+        ]
+        .concat();
+        assert_eq!(with_comments(&body, &xml), "ab\n");
+        assert_eq!(with_comments(&open, &xml), "{==open==}\n\n{==still==}\n");
+        // A range start seen twice opens once.
+        let twice = p(
+            "",
+            &format!(
+                "{}{}{}{}{}",
+                start("8"),
+                start("8"),
+                r("x"),
+                end("8"),
+                reference("8")
+            ),
+        );
+        assert_eq!(with_comments(&twice, &xml), "{==x==}{>>Ana: y<<}\n");
+    }
+
+    #[test]
+    fn comment_text_keeps_formatting_joins_paragraphs_and_escapes_delimiters() {
+        let body = p("", &format!("{}{}", r("a"), reference("1")));
+        let text = [
+            p("", r#"<w:r><w:rPr><w:b/></w:rPr><w:t>Bold</w:t></w:r><w:r><w:br/><w:t>line &lt;&lt;} end</w:t></w:r>"#),
+            p("", ""),
+            pm("", &["del"], &r("gone")),
+            p("", &format!("{}{}", r("kept"), ins(&r(" new")))),
+        ]
+        .concat();
+        let xml = comments(&[("1", "Ana", "", &text)]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "a{>>Ana: **Bold** line <<\\} end gone{-- --}kept{++ new++}<<}\n"
+        );
+    }
+
+    #[test]
+    fn comments_meet_tracked_changes_without_breaking_either() {
+        // Word wraps the reference run of a comment added with tracking on in
+        // w:ins; the note must not become an insertion.
+        let tracked = p(
+            "",
+            &format!(
+                "{}{}{}{}",
+                start("1"),
+                r("text"),
+                end("1"),
+                ins(&reference("1"))
+            ),
+        );
+        // A comment on deleted text, and a range that ends inside an insertion.
+        let deleted = p(
+            "",
+            &format!(
+                "{}{}{}{}",
+                start("1"),
+                del(&dr("old")),
+                end("1"),
+                reference("1")
+            ),
+        );
+        let crossing = p(
+            "",
+            &format!(
+                "{}{}{}{}",
+                start("1"),
+                r("a"),
+                ins(&format!("{}{}{}", r("b"), end("1"), r("c"))),
+                reference("1")
+            ),
+        );
+        let xml = comments(&[("1", "Ana", "", &p("", &r("n")))]);
+        assert_eq!(with_comments(&tracked, &xml), "{==text==}{>>Ana: n<<}\n");
+        assert_eq!(
+            with_comments(&deleted, &xml),
+            "{=={--old--}==}{>>Ana: n<<}\n"
+        );
+        assert_eq!(
+            with_comments(&crossing, &xml),
+            "{==a{++b++}==}{++c++}{>>Ana: n<<}\n"
+        );
+    }
+
+    #[test]
+    fn comment_range_around_a_text_box_does_not_cover_the_box() {
+        let body = p(
+            "",
+            &format!(
+                "{}{}{}{}{}",
+                start("1"),
+                r("anchor"),
+                text_box(&p("", &r("inside"))),
+                end("1"),
+                reference("1")
+            ),
+        );
+        let xml = comments(&[("1", "Ana", "", &p("", &r("n")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==anchor==}{>>Ana: n<<}\n\ninside\n"
+        );
+    }
+
+    #[test]
+    fn comment_part_is_found_through_the_document_relationships() {
+        let body = p("", &format!("{}{}", r("a"), reference("1")));
+        let xml = comments(&[("1", "Ana", "", &p("", &r("n")))]);
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="notes/remarks.xml"/></Relationships>"#;
+        let bytes = docx(
+            &body,
+            &[
+                ("word/_rels/document.xml.rels", rels),
+                ("word/notes/remarks.xml", &xml),
+            ],
+        );
+        assert_eq!(md(&bytes), "a{>>Ana: n<<}\n");
+    }
+
+    #[test]
+    fn comments_in_footnotes_and_ranges_left_open_before_them() {
+        let body = p(
+            "",
+            &format!(
+                "{}{}{}",
+                start("1"),
+                r("Claim"),
+                r#"<w:r><w:footnoteReference w:id="2"/></w:r>"#
+            ),
+        );
+        let footnotes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="2">{}</w:footnote></w:footnotes>"#,
+            p(
+                "",
+                &format!(
+                    "{}{}{}{}",
+                    start("2"),
+                    r("Source"),
+                    end("2"),
+                    reference("2")
+                )
+            ),
+        );
+        let xml = comments(&[
+            ("1", "Ana", "", &p("", &r("never closed"))),
+            ("2", "Bo", "", &p("", &r("check"))),
+        ]);
+        assert_eq!(
+            md(&docx(
+                &body,
+                &[
+                    ("word/comments.xml", &xml),
+                    ("word/footnotes.xml", &footnotes)
+                ]
+            )),
+            "{==Claim[^1]==}\n\n[^1]: {==Source==}{>>Bo: check<<}\n"
+        );
+    }
+
+    #[test]
+    fn substitutions_merges_and_empty_changes() {
+        let body = [
+            // Replacement written insertion first still reads old ~> new.
+            p("", &format!("{}{}{}", r("I really love "), ins(&r("font-styles")), del(&dr("fonts")))),
+            // Word splits one insertion over several w:ins; they join.
+            p("", &format!("{}{}{}", ins(&r("one ")), ins(&r("insertion")), r("."))),
+            // Empty change elements vanish; an inserted space stays.
+            p("", &format!("{}{}{}{}", r("a"), ins(""), del(&r("")), ins(&r(" ")))),
+            // Inserted by one author and deleted by another.
+            p("", &format!("{}{}", r("x"), ins(&del(&dr("y"))))),
+            // Moves are an insertion and a deletion; next to each other they read
+            // as a substitution.
+            p("", r#"<w:moveFrom w:id="3"><w:r><w:delText>here</w:delText></w:r></w:moveFrom><w:moveTo w:id="4"><w:r><w:t>there</w:t></w:r></w:moveTo>"#),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "I really love {~~fonts~>font-styles~~}\n\n{++one insertion++}.\n\na{++ ++}\n\nx{++{--y--}++}\n\n{~~here~>there~~}\n"
+        );
+    }
+
+    #[test]
+    fn delimiters_in_document_text_do_not_open_spans() {
+        let body = p("", &r("x {++ y ++} ~> z"));
+        assert_eq!(md(&docx(&body, &[])), "x {\\++ y ++\\} ~\\> z\n");
+    }
+
+    #[test]
+    fn tracked_changes_with_links_fields_and_hidden_runs() {
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://x.test" TargetMode="External"/></Relationships>"#;
+        let body = [
+            p("", &format!(r#"<w:hyperlink r:id="rId9">{}{}</w:hyperlink>"#, r("keep "), ins(&r("new")))),
+            p("", &ins(r#"<w:hyperlink r:id="rId9"><w:r><w:t>added link</w:t></w:r></w:hyperlink>"#)),
+            // A deleted hyperlink field keeps its target through w:delInstrText.
+            p("", &del(r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:delInstrText> HYPERLINK "https://f.test" </w:delInstrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:delText>old link</w:delText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#)),
+            // Hidden text is not shown in Word, tracked or not.
+            p("", &format!("{}{}", r("seen"), ins(r#"<w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden</w:t></w:r>"#))),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[("word/_rels/document.xml.rels", rels)])),
+            "[keep](https://x.test) {++[new](https://x.test)++}\n\n{++[added link](https://x.test)++}\n\n{--[old link](https://f.test)--}\n\nseen\n"
+        );
+    }
+
+    #[test]
+    fn tracked_breaks_keep_headings_lists_and_blocks_valid() {
+        let numbering = format!(
+            r#"<w:numbering {W}><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+        );
+        let item = |marks: &[&str], runs: &str| {
+            let marks: String = marks.iter().map(|m| format!("<w:{m}/>")).collect();
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr><w:rPr>{marks}</w:rPr></w:pPr>{runs}</w:p>"#
+            )
+        };
+        let body = [
+            // Before a heading the break closes after `## `.
+            pm("", &["ins"], &r("A")),
+            p("Heading2", &r("B")),
+            // Before a list item it closes after the marker; a deleted item keeps
+            // its number, as Word shows it.
+            item(&["moveFrom"], &r("one")),
+            item(&[], &del(&dr("two"))),
+            item(&["moveTo"], &r("three")),
+            item(&[], &r("four")),
+            // A blank paragraph keeps its own break; a table cannot join a paragraph.
+            pm("", &["del"], &r("C")),
+            p("", ""),
+            pm("", &["ins", "del"], &r("D")),
+            p("", &r("E")),
+            pm("", &["del"], &r("F")),
+            format!(
+                "<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>",
+                p("", &r("G"))
+            ),
+            // A paragraph holding a text box gives its break to the box.
+            pm(
+                "",
+                &["del"],
+                &format!("{}{}", r("H"), text_box(&p("", &r("box")))),
+            ),
+            p("", &r("I")),
+            // The last paragraph's mark has no break after it.
+            pm("", &["del"], &r("J")),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[("word/numbering.xml", &numbering)])),
+            "A{++\n\n## ++}B\n\n1. one{--\n2. two--}\n3. three{++\n4. ++}four\n\nC\n\nD{--\n\n--}E\n\nF\n\n|G|\n|-|\n\nH\n\nbox\n\nI\n\nJ\n"
+        );
+    }
+
+    #[test]
+    fn tracked_cells_rows_and_nested_tables() {
+        let body = format!(
+            r#"<w:tbl><w:tr><w:tc>{}{}{}</w:tc><w:tc>{}</w:tc></w:tr><w:tr><w:trPr><w:ins/></w:trPr><w:tc><w:tbl><w:tr><w:trPr><w:del/></w:trPr><w:tc>{}</w:tc><w:tc><w:tcPr><w:cellDel/></w:tcPr>{}</w:tc></w:tr></w:tbl></w:tc><w:tc>{}</w:tc></w:tr></w:tbl>"#,
+            // Paragraph marks inside a cell.
+            pm("", &["del"], &r("a")),
+            pm("", &["ins"], &r("b")),
+            pm("", &["del"], &r("c")),
+            ins(&p("", &r("block ins"))),
+            p("", &r("n1")),
+            p("", &r("n2")),
+            del(&p("", &r("wrapped"))),
+        );
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "|a{--<br>--}b{++<br>++}c|{++block ins++}|\n|-|-|\n|{++{--n1--}++}; {++{--n2--}++}|{++{--wrapped--}++}|\n"
+        );
+    }
+
+    #[test]
+    fn tracked_blocks_inside_content_controls() {
+        let body = ins(&format!(
+            "<w:sdt><w:sdtContent>{}</w:sdtContent></w:sdt><w:customXml>{}</w:customXml>",
+            p("", &r("in control")),
+            p("", &r("in custom xml")),
+        ));
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "{++in control++}\n\n{++in custom xml++}\n"
+        );
+    }
+
+    #[test]
+    fn tracked_changes_inside_inline_wrappers_and_styled_breaks() {
+        let body = [
+            // Smart tags and inline content controls wrap tracked runs too.
+            p(
+                "",
+                &format!(
+                    "<w:smartTag>{}</w:smartTag><w:sdt><w:sdtContent>{}</w:sdtContent></w:sdt>",
+                    ins(&r("tagged")),
+                    del(&dr(" boxed"))
+                ),
+            ),
+            // A heading whose own mark is deleted joins the next paragraph.
+            pm("Heading1", &["del"], &r("Title")),
+            p("", &r("Body")),
+            // A note reference without an id has nothing to point at.
+            p(
+                "",
+                &format!("{}{}", r("x"), ins(r#"<w:r><w:footnoteReference/></w:r>"#)),
+            ),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "{~~ boxed~>tagged~~}\n\n# Title{--\n\n--}Body\n\nx\n"
+        );
+    }
+
+    #[test]
+    fn comment_without_an_author_shows_only_its_date() {
+        let body = p("", &format!("{}{}", r("a"), reference("1")));
+        let xml = comments(&[("1", "", "2026-01-02T03:04:00Z", &p("", &r("anonymous")))]);
+        assert_eq!(
+            with_comments(&body, &xml),
+            "a{>>(2026-01-02T03:04:00Z): anonymous<<}\n"
+        );
+    }
+
+    #[test]
+    fn text_boxes_and_content_controls_inside_tracked_cells() {
+        let body = format!(
+            r#"<w:tbl><w:tr><w:trPr><w:del/></w:trPr><w:tc>{}</w:tc><w:tc><w:sdt><w:sdtContent>{}</w:sdtContent></w:sdt></w:tc></w:tr></w:tbl>"#,
+            // The box's own paragraph mark cannot join the box text.
+            pm(
+                "",
+                &["del"],
+                &format!("{}{}", r("cell"), text_box(&p("", &r("box"))))
+            ),
+            p("", &r("control")),
+        );
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "|{--cell--}<br>{--box--}|{--control--}|\n|-|-|\n"
         );
     }
 

@@ -26,6 +26,19 @@ How it works: anymd reads glyph positions rather than text runs. Glyphs are grou
 
 Headings, bold/italic, links, nested lists, tables with merged cells, footnotes, and equations as LaTeX.
 
+Tracked changes and comments become [CriticMarkup](https://github.com/CriticMarkup/CriticMarkup-toolkit), in the body, tables, text boxes, and footnotes:
+
+| In Word | In the Markdown |
+|---|---|
+| Inserted text, or moved text at its new place | `{++new++}` |
+| Deleted text, or moved text at its old place | `{--old--}` |
+| Deleted text next to inserted text | `{~~old~>new~~}` |
+| A comment on some text | `{==text==}{>>Ana Lima (2026-09-30T08:15:00Z): comment<<}` |
+| A comment on a point | `{>>Ana Lima (2026-09-30T08:15:00Z): comment<<}` |
+| An inserted or deleted paragraph break | `{++` or `{--` around the blank line between the paragraphs |
+
+The comment's author and date come from `w:author` and `w:date`. The date is copied exactly as stored, never converted; Word writes the author's local time there even though it ends in `Z`. Replies follow the comment they answer. Formatting-only changes are not shown. Text that happens to contain a CriticMarkup delimiter is escaped with a backslash (`{\++`), so it reads the same but opens no span.
+
 ## PowerPoint
 
 One section per slide in deck order: titles, bullets, tables, chart data, and speaker notes. `pages` selects slides.

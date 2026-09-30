@@ -217,7 +217,7 @@ Run with no arguments from an MCP client (piped stdin), or as `anymd mcp`, and i
 | Input | What you get |
 |---|---|
 | **PDF** | Reading-order Markdown: headings, paragraphs, lists, tables, sub/superscripts, `<!-- page N -->` markers, bookmarks as an outline. Running headers and page numbers are removed. Image-only pages are OCR'd when `tesseract` is installed. |
-| **Word** `.docx` | Headings, bold/italic, links, nested lists, tables with merged cells, footnotes, equations as LaTeX, tracked changes as CriticMarkup |
+| **Word** `.docx` | Headings, bold/italic, links, nested lists, tables with merged cells, footnotes, equations as LaTeX, tracked changes and comments as CriticMarkup |
 | **PowerPoint** `.pptx` | One section per slide in deck order, titles, bullets, tables, chart data, speaker notes |
 | **Excel** `.xlsx .xls .ods` · **CSV/TSV** | One table per sheet, dates as ISO strings, capped at 2,000 rows per sheet |
 | **EPUB** | One section per chapter in spine order, plus title and author |

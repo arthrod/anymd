@@ -8,6 +8,7 @@ use std::io::{Cursor, Read};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use crate::critic::{self, Mark};
 use crate::ConvertError;
 
 /// Largest uncompressed zip entry we will inflate.
@@ -686,6 +687,8 @@ pub(crate) fn image_markdown(alt: &str, target: Option<&str>) -> Option<String> 
 pub(crate) struct Blocks {
     out: String,
     last_was_list: bool,
+    /// A tracked change on the break before the next block.
+    separator: Option<Mark>,
 }
 
 impl Blocks {
@@ -693,23 +696,44 @@ impl Blocks {
         Self {
             out: String::new(),
             last_was_list: false,
+            separator: None,
         }
     }
 
+    /// A block whose start cannot carry a CriticMarkup delimiter (a table, a
+    /// text box); a tracked break before it is left unmarked.
     pub(crate) fn push(&mut self, block: &str, is_list: bool) {
-        let block = block.trim_end();
-        if block.trim().is_empty() {
+        self.separator = None;
+        self.push_prefixed("", block, is_list);
+    }
+
+    /// A block made of Markdown syntax (`## `, `  1. `) followed by its text. A
+    /// tracked break before it closes after the syntax, so the heading or list
+    /// item stays valid.
+    pub(crate) fn push_prefixed(&mut self, prefix: &str, body: &str, is_list: bool) {
+        let body = body.trim_end();
+        if body.trim().is_empty() {
             return;
         }
-        if !self.out.is_empty() {
-            self.out.push_str(if is_list && self.last_was_list {
+        let mark = self.separator.take();
+        if self.out.is_empty() {
+            self.out.push_str(prefix);
+            self.out.push_str(body);
+        } else {
+            let separator = if is_list && self.last_was_list {
                 "\n"
             } else {
                 "\n\n"
-            });
+            };
+            critic::splice(&mut self.out, separator, prefix, body, mark);
         }
-        self.out.push_str(block);
         self.last_was_list = is_list;
+    }
+
+    /// Records that the paragraph mark ending the last block was inserted or
+    /// deleted (`None` clears it).
+    pub(crate) fn set_separator(&mut self, mark: Option<Mark>) {
+        self.separator = mark;
     }
 
     pub(crate) fn finish(self) -> String {
