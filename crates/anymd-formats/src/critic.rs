@@ -304,7 +304,7 @@ fn render(nodes: &[Node], out: &mut Inline) {
             ) => {
                 out.push(&escape(text), *bold, *italic, link.as_deref());
             }
-            (Node::Leaf(Leaf::Raw(markdown)), _) => marker(out, markdown),
+            (Node::Leaf(Leaf::Raw(markdown)), _) => marker(out, &defuse(markdown)),
             (Node::Leaf(Leaf::Comment(inner)), _) => marker(out, &note(inner)),
         }
         index += 1;
@@ -349,6 +349,31 @@ pub(crate) fn escape(text: &str) -> String {
         .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
 }
 
+/// Breaks every CriticMarkup delimiter in Markdown the converter built
+/// (equations, image descriptions) with a space. A backslash would change the
+/// LaTeX; a space does not, since LaTeX ignores spaces in math, and an image
+/// description reads the same.
+fn defuse(markdown: &str) -> String {
+    const DELIMITERS: [(&str, &str); 11] = [
+        ("{++", "{ ++"),
+        ("{--", "{ --"),
+        ("{~~", "{ ~~"),
+        ("{>>", "{ >>"),
+        ("{==", "{ =="),
+        ("++}", "++ }"),
+        ("--}", "-- }"),
+        ("~~}", "~~ }"),
+        ("<<}", "<< }"),
+        ("==}", "== }"),
+        ("~>", "~ >"),
+    ];
+    DELIMITERS
+        .iter()
+        .fold(markdown.to_string(), |text, (from, to)| {
+            text.replace(from, to)
+        })
+}
+
 /// Appends `prefix` and `body` to `out` after `separator`. When the separator is
 /// itself tracked (a paragraph mark that was inserted or deleted), it is marked
 /// the way the CriticMarkup spec marks a paragraph break (`{++\n\n++}`), with
@@ -377,9 +402,10 @@ pub(crate) fn splice(
     out.push_str(separator);
     out.push_str(prefix);
     // The body's first span continues this one when it is of the same kind and
-    // its closer carries the same attribution. Escaped text cannot contain the
-    // closer, and a span never nests one of its own kind, so the first closer
-    // after the opener is that span's own.
+    // its closer carries the same attribution. Document text is escaped and
+    // converter-built Markdown is defused, so neither contains the closer, and a
+    // span never nests one of its own kind: the first closer after the opener
+    // is that span's own.
     let continues = body.strip_prefix(open).filter(|rest| {
         rest.find(close)
             .is_some_and(|at| rest[at + close.len()..].starts_with(by.as_str()))
@@ -677,16 +703,37 @@ mod tests {
     }
 
     #[test]
-    fn raw_markdown_is_content_but_not_escaped() {
+    fn raw_markdown_is_content_whose_delimiters_are_spaced_apart() {
+        // A backslash would change the LaTeX; a space does not, and it keeps a
+        // `--}` inside an equation from closing the deletion around it.
         assert_eq!(
             script(&[
-                ("open", "+"),
-                ("raw", "$x_{--}$"),
-                ("close", "+"),
+                ("open", "-"),
+                ("raw", "$x_{--}$ {++ ++} ~> {== ==} {>> <<} {~~ ~~}"),
+                ("close", "-"),
                 ("raw", "")
             ]),
-            "{++$x_{--}$++}"
+            "{--$x_{ -- }$ { ++ ++ } ~ > { == == } { >> << } { ~~ ~~ }--}"
         );
+        assert_eq!(defuse("$a+b$"), "$a+b$");
+    }
+
+    #[test]
+    fn a_tracked_break_finds_the_real_closer_past_an_equation() {
+        let mut critic = Critic::default();
+        critic.open(Del, Some("Ana"));
+        critic.raw("$x_{--}$");
+        critic.close(Del);
+        let body = critic.into_inline().render(true);
+        let mut out = "{--A--}{>>Ana<<}".to_string();
+        splice(
+            &mut out,
+            "\n\n",
+            "",
+            &body,
+            Some(&(Del, Some("Ana".into()))),
+        );
+        assert_eq!(out, "{--A\n\n$x_{ -- }$--}{>>Ana<<}");
     }
 
     #[test]
