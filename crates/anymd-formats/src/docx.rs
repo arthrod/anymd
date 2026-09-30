@@ -71,7 +71,7 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
         let text: Vec<String> = note
             .children_named("p")
             .map(|p| {
-                let (inline, _) = writer.paragraph_inline(p);
+                let (inline, _) = writer.paragraph_inline(p, None);
                 inline.render(true).replace('\n', " ")
             })
             .filter(|t| !t.trim().is_empty())
@@ -409,7 +409,7 @@ impl Writer<'_> {
             .and_then(num_pr)
             .or_else(|| style.as_deref().and_then(|s| self.styles.num(s)));
 
-        let (inline, extra) = self.paragraph_inline(p);
+        let (inline, extra) = self.paragraph_inline(p, revision);
         if !inline.is_blank() {
             if let Some(level) = heading {
                 list.reset();
@@ -430,6 +430,9 @@ impl Writer<'_> {
         for block in extra {
             list.reset();
             blocks.push(&block, false);
+        }
+        if p.path(&["pPr", "rPr", "del"]).is_some() {
+            blocks.mark_next_separator(Revision::Deletion.markers());
         }
     }
 
@@ -467,7 +470,11 @@ impl Writer<'_> {
     }
 
     /// Inline content of a paragraph plus any text-box blocks found inside it.
-    fn paragraph_inline(&mut self, p: &Element) -> (Inline, Vec<String>) {
+    fn paragraph_inline(
+        &mut self,
+        p: &Element,
+        revision: Option<Revision>,
+    ) -> (Inline, Vec<String>) {
         let mut inline = Inline::default();
         let mut extra = Vec::new();
         let mut fields = Vec::new();
@@ -477,10 +484,19 @@ impl Writer<'_> {
             .map(|s| self.styles.emphasis(s))
             .unwrap_or((None, None));
         let base = (bold.unwrap_or(false), italic.unwrap_or(false));
-        self.inline(p, None, base, &mut fields, &mut inline, &mut extra);
+        self.inline(
+            p,
+            None,
+            base,
+            &mut fields,
+            &mut inline,
+            &mut extra,
+            revision,
+        );
         (inline, extra)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inline(
         &mut self,
         container: &Element,
@@ -489,26 +505,57 @@ impl Writer<'_> {
         fields: &mut Vec<Field>,
         out: &mut Inline,
         extra: &mut Vec<String>,
+        active_revision: Option<Revision>,
     ) {
         for child in container.elements() {
             match child.local() {
-                "r" => self.run(child, link, base, fields, out, extra),
+                "r" => self.run(child, link, base, fields, out, extra, active_revision),
                 "hyperlink" => {
                     let url = child.rel_attr("id").and_then(|id| self.rels.link(id));
-                    self.inline(child, url.as_deref().or(link), base, fields, out, extra);
+                    self.inline(
+                        child,
+                        url.as_deref().or(link),
+                        base,
+                        fields,
+                        out,
+                        extra,
+                        active_revision,
+                    );
                 }
                 "fldSimple" => {
                     let url = child.attr("instr").and_then(hyperlink_instruction);
-                    self.inline(child, url.as_deref().or(link), base, fields, out, extra);
+                    self.inline(
+                        child,
+                        url.as_deref().or(link),
+                        base,
+                        fields,
+                        out,
+                        extra,
+                        active_revision,
+                    );
                 }
-                "ins" | "moveTo" => {
-                    self.revision_inline(child, Revision::Insertion, link, base, fields, out, extra)
-                }
-                "del" | "moveFrom" => {
-                    self.revision_inline(child, Revision::Deletion, link, base, fields, out, extra)
-                }
+                "ins" | "moveTo" => self.revision_inline(
+                    child,
+                    Revision::Insertion,
+                    link,
+                    base,
+                    fields,
+                    out,
+                    extra,
+                    active_revision,
+                ),
+                "del" | "moveFrom" => self.revision_inline(
+                    child,
+                    Revision::Deletion,
+                    link,
+                    base,
+                    fields,
+                    out,
+                    extra,
+                    active_revision,
+                ),
                 "smartTag" | "customXml" | "sdt" | "sdtContent" | "bdo" | "dir" => {
-                    self.inline(child, link, base, fields, out, extra)
+                    self.inline(child, link, base, fields, out, extra, active_revision)
                 }
                 "oMathPara" => {
                     let equations: Vec<String> = child
@@ -546,13 +593,32 @@ impl Writer<'_> {
         fields: &mut Vec<Field>,
         out: &mut Inline,
         extra: &mut Vec<String>,
+        active_revision: Option<Revision>,
     ) {
-        let (open, close) = revision.markers();
-        out.push(open, false, false, None);
-        self.inline(container, link, base, fields, out, extra);
-        out.push(close, false, false, None);
+        if active_revision.is_some() {
+            // The enclosing revision already covers this inline content.
+            self.inline(container, link, base, fields, out, extra, active_revision);
+            return;
+        }
+        let mut content = Inline::default();
+        self.inline(
+            container,
+            link,
+            base,
+            fields,
+            &mut content,
+            extra,
+            Some(revision),
+        );
+        if !content.is_empty() {
+            let (open, close) = revision.markers();
+            out.push(open, false, false, None);
+            out.append(content);
+            out.push(close, false, false, None);
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         run: &Element,
@@ -561,6 +627,7 @@ impl Writer<'_> {
         fields: &mut Vec<Field>,
         out: &mut Inline,
         extra: &mut Vec<String>,
+        active_revision: Option<Revision>,
     ) {
         let rpr = run.child("rPr");
         if rpr.and_then(|r| r.toggle("vanish")).unwrap_or(false) {
@@ -580,10 +647,19 @@ impl Writer<'_> {
             .or(style_italic)
             .unwrap_or(base.1);
         for child in run.elements() {
-            self.run_child(child, link, (bold, italic), fields, out, extra);
+            self.run_child(
+                child,
+                link,
+                (bold, italic),
+                fields,
+                out,
+                extra,
+                active_revision,
+            );
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_child(
         &mut self,
         child: &Element,
@@ -592,6 +668,7 @@ impl Writer<'_> {
         fields: &mut Vec<Field>,
         out: &mut Inline,
         extra: &mut Vec<String>,
+        active_revision: Option<Revision>,
     ) {
         let hidden = fields.iter().any(|f| !f.in_result);
         let field_link = fields.iter().rev().find_map(|f| f.link.clone());
@@ -642,11 +719,21 @@ impl Writer<'_> {
                     out.push(&format!("[^{number}]"), false, false, None);
                 }
             }
-            "drawing" | "pict" | "object" if !hidden => self.drawing(child, out, extra),
+            "drawing" | "pict" | "object" if !hidden => {
+                self.drawing(child, out, extra, active_revision)
+            }
             "AlternateContent" => {
                 if let Some(choice) = child.child("Choice").or_else(|| child.child("Fallback")) {
                     for inner in choice.elements() {
-                        self.run_child(inner, link, (bold, italic), fields, out, extra);
+                        self.run_child(
+                            inner,
+                            link,
+                            (bold, italic),
+                            fields,
+                            out,
+                            extra,
+                            active_revision,
+                        );
                     }
                 }
             }
@@ -655,13 +742,19 @@ impl Writer<'_> {
     }
 
     /// Images with alt text become `![alt](name)`; text boxes become extra blocks.
-    fn drawing(&mut self, drawing: &Element, out: &mut Inline, extra: &mut Vec<String>) {
+    fn drawing(
+        &mut self,
+        drawing: &Element,
+        out: &mut Inline,
+        extra: &mut Vec<String>,
+        active_revision: Option<Revision>,
+    ) {
         let mut boxes = Vec::new();
         drawing.find_all("txbxContent", &mut boxes);
         for content in boxes {
             let mut blocks = Blocks::new();
             let mut list = ListIndent::default();
-            self.blocks(content, &mut blocks, &mut list);
+            self.blocks_revised(content, &mut blocks, &mut list, active_revision);
             extra.push(blocks.finish());
         }
         if let Some(doc_pr) = drawing.find("docPr") {
@@ -694,10 +787,7 @@ impl Writer<'_> {
             row.extend(std::iter::repeat_n(String::new(), before.min(64)));
             for tc in row_cells(tr) {
                 let cell_revision = tc.child("tcPr").and_then(revision_property);
-                row.push(mark_revision(
-                    self.cell_text(tc),
-                    cell_revision.or(row_revision).or(revision),
-                ));
+                row.push(self.cell_text(tc, cell_revision.or(row_revision).or(revision)));
                 let span = tc
                     .path(&["tcPr", "gridSpan"])
                     .and_then(|g| g.attr("val"))
@@ -725,42 +815,43 @@ impl Writer<'_> {
         markdown_table(&rows)
     }
 
-    fn cell_text(&mut self, cell: &Element) -> String {
+    fn cell_text(&mut self, cell: &Element, revision: Option<Revision>) -> String {
         let mut parts = Vec::new();
-        self.cell_parts(cell, &mut parts);
+        self.cell_parts(cell, &mut parts, revision);
         parts.retain(|p| !p.trim().is_empty());
         parts.join("<br>").replace('\n', "<br>")
     }
 
-    fn cell_parts(&mut self, container: &Element, parts: &mut Vec<String>) {
+    fn cell_parts(
+        &mut self,
+        container: &Element,
+        parts: &mut Vec<String>,
+        revision: Option<Revision>,
+    ) {
         for child in container.elements() {
             match child.local() {
                 "p" => {
-                    let (inline, extra) = self.paragraph_inline(child);
-                    parts.push(inline.render(true));
+                    let (inline, extra) = self.paragraph_inline(child, revision);
+                    parts.push(mark_revision(inline.render(true), revision));
                     parts.extend(extra);
                 }
                 "tbl" => {
                     // Nested tables are flattened to text, one row per line.
                     for tr in table_rows(child) {
                         let cells: Vec<String> = row_cells(tr)
-                            .map(|tc| self.cell_text(tc))
+                            .map(|tc| self.cell_text(tc, revision))
                             .filter(|t| !t.is_empty())
                             .collect();
                         parts.push(cells.join("; "));
                     }
                 }
                 "ins" | "moveTo" => {
-                    let start = parts.len();
-                    self.cell_parts(child, parts);
-                    mark_parts(parts, start, Revision::Insertion);
+                    self.cell_parts(child, parts, revision.or(Some(Revision::Insertion)));
                 }
                 "del" | "moveFrom" => {
-                    let start = parts.len();
-                    self.cell_parts(child, parts);
-                    mark_parts(parts, start, Revision::Deletion);
+                    self.cell_parts(child, parts, revision.or(Some(Revision::Deletion)));
                 }
-                "sdt" | "sdtContent" | "customXml" => self.cell_parts(child, parts),
+                "sdt" | "sdtContent" | "customXml" => self.cell_parts(child, parts, revision),
                 _ => {}
             }
         }
@@ -776,15 +867,6 @@ fn mark_revision(text: String, revision: Option<Revision>) -> String {
     }
     let (open, close) = revision.markers();
     format!("{open}{text}{close}")
-}
-
-fn mark_parts(parts: &mut Vec<String>, start: usize, revision: Revision) {
-    if start >= parts.len() {
-        return;
-    }
-    let (open, close) = revision.markers();
-    parts[start].insert_str(0, open);
-    parts.last_mut().expect("a part was added").push_str(close);
 }
 
 fn revision_property(properties: &Element) -> Option<Revision> {
@@ -1262,6 +1344,65 @@ mod tests {
         assert_eq!(
             md(&docx(&body, &[])),
             "|Before|After|\n|-|-|\n|{--old--}|{++new++}|\n"
+        );
+    }
+
+    #[test]
+    fn deleted_paragraph_mark_preserves_text_and_marks_only_the_separator() {
+        let body = r#"<w:p><w:pPr><w:rPr><w:del w:id="1"/></w:rPr></w:pPr><w:r><w:t>First</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second</w:t></w:r></w:p>
+<w:p><w:r><w:t>Third</w:t></w:r></w:p>"#;
+        assert_eq!(md(&docx(body, &[])), "First{--\n\n--}Second\n\nThird\n");
+    }
+
+    #[test]
+    fn deleted_text_boxes_keep_block_structure_without_an_empty_paragraph() {
+        let content = r#"<w:txbxContent>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Heading</w:t></w:r></w:p>
+<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:del><w:r><w:delText>Item</w:delText></w:r></w:del></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:txbxContent>"#;
+        let numbering = format!(
+            r#"<w:numbering {W}><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+        );
+        let expected = "## {--Heading--}\n\n- {--Item--}\n\n|{--Cell--}|\n|-|\n";
+        for drawing in ["drawing", "pict", "object"] {
+            let run = format!("<w:r><w:{drawing}>{content}</w:{drawing}></w:r>");
+            for body in [
+                p("", &format!("<w:del>{run}</w:del>")),
+                format!("<w:del>{}</w:del>", p("", &run)),
+                p(
+                    "",
+                    &format!(
+                        r#"<w:del><w:hyperlink w:anchor="bookmark"><w:sdt><w:sdtContent>{run}</w:sdtContent></w:sdt></w:hyperlink></w:del>"#
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    md(&docx(&body, &[("word/numbering.xml", &numbering)])),
+                    expected
+                );
+            }
+        }
+        let body = p("", &format!("{}<w:del><w:r><w:delText>Old</w:delText><w:drawing>{content}</w:drawing></w:r></w:del>", r("Keep ")));
+        assert_eq!(
+            md(&docx(&body, &[("word/numbering.xml", &numbering)])),
+            format!("Keep {{--Old--}}\n\n{expected}")
+        );
+    }
+
+    #[test]
+    fn deleted_row_with_inline_deletion_has_no_nested_delimiters() {
+        let body = r#"<w:tbl>
+<w:tr><w:tc><w:p><w:r><w:t>Header</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:trPr><w:del w:id="1"/></w:trPr><w:tc><w:p>
+<w:r><w:t xml:space="preserve">Before </w:t></w:r>
+<w:del w:id="2"><w:r><w:rPr><w:b/></w:rPr><w:delText>old</w:delText></w:r></w:del>
+<w:r><w:t xml:space="preserve"> after</w:t></w:r>
+</w:p></w:tc></w:tr></w:tbl>"#;
+        assert_eq!(
+            md(&docx(body, &[])),
+            "|Header|\n|-|\n|{--Before **old** after--}|\n"
         );
     }
 

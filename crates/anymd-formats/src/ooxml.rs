@@ -538,6 +538,16 @@ impl Inline {
         });
     }
 
+    pub(crate) fn append(&mut self, other: Self) {
+        for span in other.spans {
+            self.push(&span.text, span.bold, span.italic, span.link.as_deref());
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     pub(crate) fn is_blank(&self) -> bool {
         self.spans.iter().all(|s| s.text.trim().is_empty())
     }
@@ -686,6 +696,7 @@ pub(crate) fn image_markdown(alt: &str, target: Option<&str>) -> Option<String> 
 pub(crate) struct Blocks {
     out: String,
     last_was_list: bool,
+    separator_markers: Option<(&'static str, &'static str)>,
 }
 
 impl Blocks {
@@ -693,6 +704,7 @@ impl Blocks {
         Self {
             out: String::new(),
             last_was_list: false,
+            separator_markers: None,
         }
     }
 
@@ -701,15 +713,26 @@ impl Blocks {
         if block.trim().is_empty() {
             return;
         }
-        if !self.out.is_empty() {
+        if !self.out.is_empty() || self.separator_markers.is_some() {
+            if let Some((open, _)) = self.separator_markers {
+                self.out.push_str(open);
+            }
             self.out.push_str(if is_list && self.last_was_list {
                 "\n"
             } else {
                 "\n\n"
             });
+            if let Some((_, close)) = self.separator_markers.take() {
+                self.out.push_str(close);
+            }
         }
         self.out.push_str(block);
         self.last_was_list = is_list;
+    }
+
+    /// Apply revision markers to the separator before the next nonempty block.
+    pub(crate) fn mark_next_separator(&mut self, markers: (&'static str, &'static str)) {
+        self.separator_markers = Some(markers);
     }
 
     pub(crate) fn finish(self) -> String {
