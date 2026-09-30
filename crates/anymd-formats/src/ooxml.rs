@@ -679,7 +679,13 @@ pub(crate) fn image_markdown(alt: &str, target: Option<&str>) -> Option<String> 
     Some(format!(
         "![{}]({})",
         alt.replace('[', "\\[").replace(']', "\\]"),
+        // Characters a URI may not hold, encoded; `{`, `}`, `<` and `>` would
+        // otherwise form CriticMarkup delimiters.
         name.replace(' ', "%20")
+            .replace('{', "%7B")
+            .replace('}', "%7D")
+            .replace('<', "%3C")
+            .replace('>', "%3E")
     ))
 }
 

@@ -1368,6 +1368,21 @@ mod tests {
     }
 
     #[test]
+    fn image_names_keep_delimiter_characters_out_of_the_markup() {
+        let image = r#"<w:r><w:drawing><wp:inline xmlns:wp="wp"><wp:docPr id="1" name="P" descr="x"/><a:graphic xmlns:a="a"><a:graphicData><pic:pic xmlns:pic="p"><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#;
+        let bytes = docx(
+            &p("", &format!("<w:del>{image}</w:del>")),
+            &[(
+                "word/_rels/document.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/a--}~&gt;{b}&lt;.png"/></Relationships>"#,
+            )],
+        );
+        // `{`, `}`, `<` and `>` may not appear in a URI; encoded, they cannot form a
+        // delimiter, so the destination reaches the Markdown unchanged.
+        assert_eq!(md(&bytes), "{--![x](a--%7D~%3E%7Bb%7D%3C.png)--}\n");
+    }
+
+    #[test]
     fn tracked_changes_become_critic_markup_without_losing_formatting() {
         let body = [
             p(
