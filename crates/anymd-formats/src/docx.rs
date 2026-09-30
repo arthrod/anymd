@@ -2027,6 +2027,65 @@ mod tests {
     }
 
     #[test]
+    fn deleted_paragraph_mark_preserves_text_and_marks_only_the_separator() {
+        let body = r#"<w:p><w:pPr><w:rPr><w:del w:id="1"/></w:rPr></w:pPr><w:r><w:t>First</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second</w:t></w:r></w:p>
+<w:p><w:r><w:t>Third</w:t></w:r></w:p>"#;
+        assert_eq!(md(&docx(body, &[])), "First{--\n\n--}Second\n\nThird\n");
+    }
+
+    #[test]
+    fn deleted_text_boxes_keep_block_structure_without_an_empty_paragraph() {
+        let content = r#"<w:txbxContent>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Heading</w:t></w:r></w:p>
+<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:del><w:r><w:delText>Item</w:delText></w:r></w:del></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:txbxContent>"#;
+        let numbering = format!(
+            r#"<w:numbering {W}><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+        );
+        let expected = "## {--Heading--}\n\n- {--Item--}\n\n|{--Cell--}|\n|-|\n";
+        for drawing in ["drawing", "pict", "object"] {
+            let run = format!("<w:r><w:{drawing}>{content}</w:{drawing}></w:r>");
+            for body in [
+                p("", &format!("<w:del>{run}</w:del>")),
+                format!("<w:del>{}</w:del>", p("", &run)),
+                p(
+                    "",
+                    &format!(
+                        r#"<w:del><w:hyperlink w:anchor="bookmark"><w:sdt><w:sdtContent>{run}</w:sdtContent></w:sdt></w:hyperlink></w:del>"#
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    md(&docx(&body, &[("word/numbering.xml", &numbering)])),
+                    expected
+                );
+            }
+        }
+        let body = p("", &format!("{}<w:del><w:r><w:delText>Old</w:delText><w:drawing>{content}</w:drawing></w:r></w:del>", r("Keep ")));
+        assert_eq!(
+            md(&docx(&body, &[("word/numbering.xml", &numbering)])),
+            format!("Keep {{--Old--}}\n\n{expected}")
+        );
+    }
+
+    #[test]
+    fn deleted_row_with_inline_deletion_has_no_nested_delimiters() {
+        let body = r#"<w:tbl>
+<w:tr><w:tc><w:p><w:r><w:t>Header</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:trPr><w:del w:id="1"/></w:trPr><w:tc><w:p>
+<w:r><w:t xml:space="preserve">Before </w:t></w:r>
+<w:del w:id="2"><w:r><w:rPr><w:b/></w:rPr><w:delText>old</w:delText></w:r></w:del>
+<w:r><w:t xml:space="preserve"> after</w:t></w:r>
+</w:p></w:tc></w:tr></w:tbl>"#;
+        assert_eq!(
+            md(&docx(body, &[])),
+            "|Header|\n|-|\n|{--Before **old** after--}|\n"
+        );
+    }
+
+    #[test]
     fn malformed_input_is_invalid_not_panic() {
         assert!(matches!(
             convert(b"not a zip", &Options::default()),
