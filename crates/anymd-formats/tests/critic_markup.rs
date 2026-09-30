@@ -112,3 +112,18 @@ fn every_comment_names_its_author_and_word_date() {
     assert!(markdown.contains("{>>Bill Winter (2024-04-08T10:32:00Z): true<<}"));
     assert!(markdown.contains("{>>Ana Lima (2026-09-30T08:15:00Z): This is a comment<<}"));
 }
+
+#[test]
+fn every_change_names_its_author_and_date() {
+    let markdown = markdown();
+    for change in [
+        "{-- to people that--}{>>Bo Chen (2026-09-29T15:12:00Z)<<}",
+        "{~~fonts~>font-styles~~}{>>Ana Lima (2026-09-29T14:05:00Z)<<}",
+        // LibreOffice splits this insertion in two; one author, one note.
+        "{++**any** ++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}",
+        "{--This whole paragraph was cut.\n\n--}{>>Ana Lima (2026-09-30T09:00:00Z)<<}",
+        "{++\n\n++}{>>Bo Chen (2026-09-30T09:30:00Z)<<}",
+    ] {
+        assert!(markdown.contains(change), "{change} not in {markdown}");
+    }
+}

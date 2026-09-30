@@ -30,14 +30,16 @@ Tracked changes and comments become [CriticMarkup](https://github.com/CriticMark
 
 | In Word | In the Markdown |
 |---|---|
-| Inserted text, or moved text at its new place | `{++new++}` |
-| Deleted text, or moved text at its old place | `{--old--}` |
-| Deleted text next to inserted text | `{~~old~>new~~}` |
+| Inserted text, or moved text at its new place | `{++new++}{>>Ana Lima (2026-09-29T14:05:00Z)<<}` |
+| Deleted text, or moved text at its old place | `{--old--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}` |
+| Deleted text next to inserted text | `{~~old~>new~~}{>>Ana Lima (2026-09-29T14:05:00Z)<<}` |
 | A comment on some text | `{==text==}{>>Ana Lima (2026-09-30T08:15:00Z): comment<<}` |
 | A comment on a point | `{>>Ana Lima (2026-09-30T08:15:00Z): comment<<}` |
-| An inserted or deleted paragraph break | `{++` or `{--` around the blank line between the paragraphs |
+| An inserted or deleted paragraph break | `{++` or `{--` around the blank line between the paragraphs, then its author and date |
 
-The comment's author and date come from `w:author` and `w:date`. The date is copied exactly as stored, never converted; Word writes the author's local time there even though it ends in `Z`. Replies follow the comment they answer. Formatting-only changes are not shown. Text that happens to contain a CriticMarkup delimiter is escaped with a backslash (`{\++`), so it reads the same but opens no span.
+Every tracked change is followed by who made it and when, as a comment, which is how CriticMarkup tracks several authors. A substitution made by two people names both, the deletion's author first. Neighbouring changes join into one only when the same person made them at the same time. Tracked changes inside a comment's own text keep their marks but not their author, since a comment cannot hold another comment.
+
+The author and date of changes and comments come from `w:author` and `w:date`. The date is copied exactly as stored, never converted; Word writes the author's local time there even though it ends in `Z`. Replies follow the comment they answer. Formatting-only changes are not shown. Text that happens to contain a CriticMarkup delimiter is escaped with a backslash (`{\++`), so it reads the same but opens no span.
 
 ## PowerPoint
 

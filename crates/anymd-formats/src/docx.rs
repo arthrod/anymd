@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::critic::{self, Critic, Mark};
+use crate::critic::{self, Change, Critic, Mark};
 use crate::ooxml::{self, Blocks, Element, ListIndent, Package, Rels};
 use crate::{markdown_table, ConvertError, Converted, Options, Section};
 
@@ -343,24 +343,33 @@ struct Field {
     link: Option<String>,
 }
 
-/// Insertions and move destinations are insertions; deletions and move sources
-/// are deletions (the representation pandiff uses too).
-fn mark_of(name: &str) -> Mark {
-    if matches!(name, "ins" | "moveTo") {
+/// A revision element (`w:ins`, `w:del`, `w:moveTo`, `w:moveFrom`) as a tracked
+/// change. Insertions and move destinations are insertions; deletions and move
+/// sources are deletions (the representation pandiff uses too).
+fn change_of(element: &Element) -> Change {
+    let mark = if matches!(element.local(), "ins" | "moveTo") {
         Mark::Insertion
     } else {
         Mark::Deletion
-    }
+    };
+    (mark, attribution(element))
+}
+
+/// Who made a tracked change and when: `w:author` and `w:date` exactly as
+/// stored, in the same form as a comment's (`Ana Lima (2026-09-29T14:05:00Z)`).
+fn attribution(element: &Element) -> Option<String> {
+    let by = comment_note(element.attr("author"), element.attr("date"), "");
+    (!by.is_empty()).then_some(by)
 }
 
 /// Tracked changes recorded in a properties element (`trPr`, `tcPr`, a
 /// paragraph mark's `rPr`), in document order.
-fn revision_marks(properties: &Element) -> Vec<Mark> {
+fn revision_marks(properties: &Element) -> Vec<Change> {
     properties
         .elements()
         .filter_map(|p| match p.local() {
-            "ins" | "moveTo" | "cellIns" => Some(Mark::Insertion),
-            "del" | "moveFrom" | "cellDel" => Some(Mark::Deletion),
+            "ins" | "moveTo" | "cellIns" => Some((Mark::Insertion, attribution(p))),
+            "del" | "moveFrom" | "cellDel" => Some((Mark::Deletion, attribution(p))),
             _ => None,
         })
         .collect()
@@ -369,16 +378,13 @@ fn revision_marks(properties: &Element) -> Vec<Mark> {
 /// The tracked change on the mark that ends a paragraph, that is on the break
 /// between it and the next one. A mark inserted and then deleted counts as
 /// deleted, the later of the two changes.
-fn paragraph_mark(p: &Element) -> Option<Mark> {
+fn paragraph_mark(p: &Element) -> Option<Change> {
     let marks = p
         .path(&["pPr", "rPr"])
         .map(revision_marks)
         .unwrap_or_default();
-    if marks.contains(&Mark::Deletion) {
-        Some(Mark::Deletion)
-    } else {
-        marks.first().copied()
-    }
+    let deleted = marks.iter().position(|(m, _)| *m == Mark::Deletion);
+    marks.into_iter().nth(deleted.unwrap_or(0))
 }
 
 /// A comment's `{>>…<<}` text: `Author (date): comment`. The date is Word's
@@ -410,7 +416,7 @@ struct Writer<'a> {
     /// (is_endnote, id) in first-reference order.
     note_refs: Vec<(bool, String)>,
     /// Tracked changes around the content being written, outermost first.
-    revisions: Vec<Mark>,
+    revisions: Vec<Change>,
     /// Comment id → the inside of its `{>>…<<}` note.
     comments: HashMap<String, String>,
     /// Comments with a `commentReference`, where their note goes. Others get
@@ -436,7 +442,7 @@ impl Writer<'_> {
                     }
                 }
                 "ins" | "moveTo" | "del" | "moveFrom" => {
-                    self.revised(mark_of(child.local()), |w| w.blocks(child, blocks, list));
+                    self.revised(change_of(child), |w| w.blocks(child, blocks, list));
                 }
                 "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, None),
                 "customXml" | "sdtContent" | "txbxContent" => self.blocks(child, blocks, list),
@@ -446,8 +452,8 @@ impl Writer<'_> {
     }
 
     /// Writes content inside a tracked change.
-    fn revised(&mut self, mark: Mark, write: impl FnOnce(&mut Self)) {
-        self.revisions.push(mark);
+    fn revised(&mut self, change: Change, write: impl FnOnce(&mut Self)) {
+        self.revisions.push(change);
         write(self);
         self.revisions.pop();
     }
@@ -467,7 +473,7 @@ impl Writer<'_> {
             (true, None) => {
                 self.open_comments.push(id.to_string());
                 if let Some(out) = out {
-                    out.open(Mark::Highlight);
+                    out.open(Mark::Highlight, None);
                 }
             }
             (false, Some(at)) => {
@@ -578,11 +584,11 @@ impl Writer<'_> {
             .map(|s| self.styles.emphasis(s))
             .unwrap_or((None, None));
         let base = (bold.unwrap_or(false), italic.unwrap_or(false));
-        for &mark in &self.revisions {
-            inline.open(mark);
+        for (mark, by) in &self.revisions {
+            inline.open(*mark, by.as_deref());
         }
         for _ in &self.open_comments {
-            inline.open(Mark::Highlight);
+            inline.open(Mark::Highlight, None);
         }
         self.inline(p, None, base, &mut fields, &mut inline, &mut extra);
         (inline, extra)
@@ -609,9 +615,11 @@ impl Writer<'_> {
                     self.inline(child, url.as_deref().or(link), base, fields, out, extra);
                 }
                 "ins" | "moveTo" | "del" | "moveFrom" => {
-                    let mark = mark_of(child.local());
-                    out.open(mark);
-                    self.revised(mark, |w| w.inline(child, link, base, fields, out, extra));
+                    let (mark, by) = change_of(child);
+                    out.open(mark, by.as_deref());
+                    self.revised((mark, by), |w| {
+                        w.inline(child, link, base, fields, out, extra);
+                    });
                     out.close(mark);
                 }
                 "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, Some(out)),
@@ -818,7 +826,7 @@ impl Writer<'_> {
 
     /// A cell's paragraphs joined with `<br>`, inside the tracked changes of its
     /// row (`trPr`) and of the cell itself (`tcPr`).
-    fn cell_text(&mut self, row_marks: &[Mark], cell: &Element) -> String {
+    fn cell_text(&mut self, row_marks: &[Change], cell: &Element) -> String {
         let depth = self.revisions.len();
         self.revisions.extend_from_slice(row_marks);
         if let Some(properties) = cell.child("tcPr") {
@@ -831,7 +839,7 @@ impl Writer<'_> {
     }
 
     /// Paragraph texts in a cell, each with the tracked change on its mark.
-    fn cell_parts(&mut self, container: &Element, parts: &mut Vec<(String, Option<Mark>)>) {
+    fn cell_parts(&mut self, container: &Element, parts: &mut Vec<(String, Option<Change>)>) {
         for child in container.elements() {
             match child.local() {
                 "p" => {
@@ -852,7 +860,7 @@ impl Writer<'_> {
                     }
                 }
                 "ins" | "moveTo" | "del" | "moveFrom" => {
-                    self.revised(mark_of(child.local()), |w| w.cell_parts(child, parts));
+                    self.revised(change_of(child), |w| w.cell_parts(child, parts));
                 }
                 "commentRangeStart" | "commentRangeEnd" => self.comment_range(child, None),
                 "sdt" | "sdtContent" | "customXml" => self.cell_parts(child, parts),
@@ -874,8 +882,12 @@ impl Writer<'_> {
                 .map(|p| {
                     let (inline, _) = self.paragraph_inline(p);
                     (
-                        inline.into_inline().render(true).replace('\n', " "),
-                        paragraph_mark(p),
+                        inline
+                            .unattributed()
+                            .into_inline()
+                            .render(true)
+                            .replace('\n', " "),
+                        paragraph_mark(p).map(|(mark, _)| (mark, None)),
                     )
                 })
                 .collect();
@@ -1407,7 +1419,10 @@ mod tests {
             p("", &r("Head")),
             pm("", &["del"], &del(&dr("old"))),
         );
-        assert_eq!(md(&docx(&body, &[])), "|Head|\n|-|\n|{--old--}|\n");
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "|Head|\n|-|\n|{--old--}{>>Ana (2026-01-02T03:04:00Z)<<}|\n"
+        );
     }
 
     #[test]
@@ -1423,23 +1438,32 @@ mod tests {
         // The deleted box leaves no empty `{----}` paragraph behind.
         assert_eq!(
             md(&docx(&body, &[])),
-            "{--Deleted box--}\n\nKeep\n\n{++Added box++}\n"
+            "{--Deleted box--}{>>Ana (2026-01-02T03:04:00Z)<<}\n\nKeep\n\n{++Added box++}{>>Ana (2026-01-02T03:04:00Z)<<}\n"
         );
     }
 
     #[test]
     fn review_tracked_paragraph_marks_mark_the_break() {
         let deleted = [pm("", &["del"], &r("A")), p("", &r("B"))].concat();
-        assert_eq!(md(&docx(&deleted, &[])), "A{--\n\n--}B\n");
+        assert_eq!(
+            md(&docx(&deleted, &[])),
+            "A{--\n\n--}{>>Ana (2026-01-02T03:04:00Z)<<}B\n"
+        );
         let inserted = [pm("", &["ins"], &r("A")), p("", &r("B"))].concat();
-        assert_eq!(md(&docx(&inserted, &[])), "A{++\n\n++}B\n");
+        assert_eq!(
+            md(&docx(&inserted, &[])),
+            "A{++\n\n++}{>>Ana (2026-01-02T03:04:00Z)<<}B\n"
+        );
         // A whole deleted paragraph: its text and its break are one deletion.
         let whole = [
             pm("", &["del"], &del(&dr("Deleted paragraph"))),
             p("", &r("Next")),
         ]
         .concat();
-        assert_eq!(md(&docx(&whole, &[])), "{--Deleted paragraph\n\n--}Next\n");
+        assert_eq!(
+            md(&docx(&whole, &[])),
+            "{--Deleted paragraph\n\n--}{>>Ana (2026-01-02T03:04:00Z)<<}Next\n"
+        );
     }
 
     #[test]
@@ -1459,7 +1483,7 @@ mod tests {
         );
         assert_eq!(
             md(&docx(&body, &[("word/footnotes.xml", &footnotes)])),
-            "Claim[^1]\n\n[^1]: Source{++ updated++}{-- --}page 4\n"
+            "Claim[^1]\n\n[^1]: Source{++ updated++}{>>Ana (2026-01-02T03:04:00Z)<<}{-- --}{>>Ana (2026-01-02T03:04:00Z)<<}page 4\n"
         );
     }
 
@@ -1761,11 +1785,11 @@ mod tests {
         assert_eq!(with_comments(&tracked, &xml), "{==text==}{>>Ana: n<<}\n");
         assert_eq!(
             with_comments(&deleted, &xml),
-            "{=={--old--}==}{>>Ana: n<<}\n"
+            "{=={--old--}{>>Ana (2026-01-02T03:04:00Z)<<}==}{>>Ana: n<<}\n"
         );
         assert_eq!(
             with_comments(&crossing, &xml),
-            "{==a{++b++}==}{++c++}{>>Ana: n<<}\n"
+            "{==a{++b++}{>>Ana (2026-01-02T03:04:00Z)<<}==}{++c++}{>>Ana (2026-01-02T03:04:00Z)<<}{>>Ana: n<<}\n"
         );
     }
 
@@ -1862,7 +1886,7 @@ mod tests {
         .concat();
         assert_eq!(
             md(&docx(&body, &[])),
-            "I really love {~~fonts~>font-styles~~}\n\n{++one insertion++}.\n\na{++ ++}\n\nx{++{--y--}++}\n\n{~~here~>there~~}\n"
+            "I really love {~~fonts~>font-styles~~}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n{++one insertion++}{>>Ana (2026-01-02T03:04:00Z)<<}.\n\na{++ ++}{>>Ana (2026-01-02T03:04:00Z)<<}\n\nx{++{--y--}{>>Ana (2026-01-02T03:04:00Z)<<}++}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n{~~here~>there~~}\n"
         );
     }
 
@@ -1886,7 +1910,7 @@ mod tests {
         .concat();
         assert_eq!(
             md(&docx(&body, &[("word/_rels/document.xml.rels", rels)])),
-            "[keep](https://x.test) {++[new](https://x.test)++}\n\n{++[added link](https://x.test)++}\n\n{--[old link](https://f.test)--}\n\nseen\n"
+            "[keep](https://x.test) {++[new](https://x.test)++}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n{++[added link](https://x.test)++}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n{--[old link](https://f.test)--}{>>Ana (2026-01-02T03:04:00Z)<<}\n\nseen\n"
         );
     }
 
@@ -1934,7 +1958,7 @@ mod tests {
         .concat();
         assert_eq!(
             md(&docx(&body, &[("word/numbering.xml", &numbering)])),
-            "A{++\n\n## ++}B\n\n1. one{--\n2. two--}\n3. three{++\n4. ++}four\n\nC\n\nD{--\n\n--}E\n\nF\n\n|G|\n|-|\n\nH\n\nbox\n\nI\n\nJ\n"
+            "A{++\n\n## ++}{>>Ana (2026-01-02T03:04:00Z)<<}B\n\n1. one{--\n2. two--}{>>Ana (2026-01-02T03:04:00Z)<<}\n3. three{++\n4. ++}four\n\nC\n\nD{--\n\n--}{>>Ana (2026-01-02T03:04:00Z)<<}E\n\nF\n\n|G|\n|-|\n\nH\n\nbox\n\nI\n\nJ\n"
         );
     }
 
@@ -1953,7 +1977,7 @@ mod tests {
         );
         assert_eq!(
             md(&docx(&body, &[])),
-            "|a{--<br>--}b{++<br>++}c|{++block ins++}|\n|-|-|\n|{++{--n1--}++}; {++{--n2--}++}|{++{--wrapped--}++}|\n"
+            "|a{--<br>--}{>>Ana (2026-01-02T03:04:00Z)<<}b{++<br>++}{>>Ana (2026-01-02T03:04:00Z)<<}c|{++block ins++}{>>Ana (2026-01-02T03:04:00Z)<<}|\n|-|-|\n|{++{--n1--}++}; {++{--n2--}++}|{++{--wrapped--}{>>Ana (2026-01-02T03:04:00Z)<<}++}|\n"
         );
     }
 
@@ -1966,7 +1990,7 @@ mod tests {
         ));
         assert_eq!(
             md(&docx(&body, &[])),
-            "{++in control++}\n\n{++in custom xml++}\n"
+            "{++in control++}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n{++in custom xml++}{>>Ana (2026-01-02T03:04:00Z)<<}\n"
         );
     }
 
@@ -1994,7 +2018,7 @@ mod tests {
         .concat();
         assert_eq!(
             md(&docx(&body, &[])),
-            "{~~ boxed~>tagged~~}\n\n# Title{--\n\n--}Body\n\nx\n"
+            "{~~ boxed~>tagged~~}{>>Ana (2026-01-02T03:04:00Z)<<}\n\n# Title{--\n\n--}{>>Ana (2026-01-02T03:04:00Z)<<}Body\n\nx\n"
         );
     }
 
@@ -2082,6 +2106,110 @@ mod tests {
         assert_eq!(
             md(&docx(body, &[])),
             "|Header|\n|-|\n|{--Before **old** after--}|\n"
+        );
+    }
+
+    /// A revision element with an explicit author and date (either may be empty
+    /// to leave the attribute out).
+    fn by(tag: &str, author: &str, date: &str, content: &str) -> String {
+        let author = if author.is_empty() {
+            String::new()
+        } else {
+            format!(r#" w:author="{author}""#)
+        };
+        let date = if date.is_empty() {
+            String::new()
+        } else {
+            format!(r#" w:date="{date}""#)
+        };
+        format!(r#"<w:{tag} w:id="7"{author}{date}>{content}</w:{tag}>"#)
+    }
+
+    #[test]
+    fn every_tracked_change_names_its_author_and_date_as_word_stores_them() {
+        let t1 = "2026-09-29T14:05:00Z";
+        let t2 = "2026-09-29T15:10:00Z";
+        let body = [
+            // One person's replacement: one note after the substitution.
+            p(
+                "",
+                &format!(
+                    "{}{}",
+                    by("del", "Ana Lima", t1, &dr("fonts")),
+                    by("ins", "Ana Lima", t1, &r("styles"))
+                ),
+            ),
+            // Two people's: both notes, old side first.
+            p(
+                "",
+                &format!(
+                    "{}{}",
+                    by("del", "Ana Lima", t1, &dr("old")),
+                    by("ins", "Bo Chen", t2, &r("new"))
+                ),
+            ),
+            // The same author at two times stays two changes.
+            p(
+                "",
+                &format!(
+                    "{}{}",
+                    by("ins", "Ana Lima", t1, &r("a")),
+                    by("ins", "Ana Lima", t2, &r("b"))
+                ),
+            ),
+            // Moves carry their own attribution.
+            p("", &by("moveTo", "Bo Chen", t2, &r("moved here"))),
+            // Missing date, missing author, neither, and a name that needs escaping.
+            p(
+                "",
+                &format!(
+                    "{}{}{}{}",
+                    by("ins", "Ana Lima", "", &r("w")),
+                    by("del", "", t1, &dr("x")),
+                    by("ins", "", "", &r("y")),
+                    by("ins", "A <<} B", t1, &r("z")),
+                ),
+            ),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "{~~fonts~>styles~~}{>>Ana Lima (2026-09-29T14:05:00Z)<<}\n\n\
+             {~~old~>new~~}{>>Ana Lima (2026-09-29T14:05:00Z)<<}{>>Bo Chen (2026-09-29T15:10:00Z)<<}\n\n\
+             {++a++}{>>Ana Lima (2026-09-29T14:05:00Z)<<}{++b++}{>>Ana Lima (2026-09-29T15:10:00Z)<<}\n\n\
+             {++moved here++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}\n\n\
+             {~~x~>w~~}{>>(2026-09-29T14:05:00Z)<<}{>>Ana Lima<<}{++y++}{++z++}{>>A <<\\} B (2026-09-29T14:05:00Z)<<}\n"
+        );
+    }
+
+    #[test]
+    fn paragraph_breaks_rows_and_cells_carry_their_own_attribution() {
+        let t1 = "2026-09-29T14:05:00Z";
+        let t2 = "2026-09-29T15:10:00Z";
+        let mark = |author: &str, date: &str| {
+            format!(
+                r#"<w:pPr><w:rPr><w:del w:id="8" w:author="{author}" w:date="{date}"/></w:rPr></w:pPr>"#
+            )
+        };
+        let body = [
+            // Text deleted by Ana, the break after it by Bo: two changes.
+            format!("<w:p>{}{}</w:p>", mark("Bo Chen", t2), by("del", "Ana Lima", t1, &dr("A"))),
+            p("", &r("Next")),
+            // Text and break both deleted by Ana at t1: one change.
+            format!("<w:p>{}{}</w:p>", mark("Ana Lima", t1), by("del", "Ana Lima", t1, &dr("B"))),
+            p("", &by("del", "Ana Lima", t1, &dr("C"))),
+            format!(
+                r#"<w:tbl><w:tr><w:trPr><w:ins w:id="9" w:author="Bo Chen" w:date="{t2}"/></w:trPr><w:tc>{}</w:tc><w:tc><w:tcPr><w:cellDel w:id="10" w:author="Ana Lima" w:date="{t1}"/></w:tcPr>{}</w:tc></w:tr></w:tbl>"#,
+                p("", &r("row")),
+                p("", &r("cell")),
+            ),
+        ]
+        .concat();
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "{--A--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}{--\n\n--}{>>Bo Chen (2026-09-29T15:10:00Z)<<}Next\n\n\
+             {--B\n\nC--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}\n\n\
+             |{++row++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}|{++{--cell--}{>>Ana Lima (2026-09-29T14:05:00Z)<<}++}{>>Bo Chen (2026-09-29T15:10:00Z)<<}|\n|-|-|\n"
         );
     }
 

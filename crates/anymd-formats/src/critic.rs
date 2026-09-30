@@ -13,6 +13,11 @@
 //! - comments inside a highlight move to right after it (`{==text==}{>>note<<}`);
 //! - a deletion next to an insertion becomes a substitution (`{~~old~>new~~}`).
 //!
+//! An insertion or deletion can carry who made it and when. That attribution
+//! follows the change as a comment, which is how the CriticMarkup spec tracks
+//! several authors: `{++new++}{>>Ana Lima (2026-09-29T14:05:00Z)<<}`. Neighbours
+//! join only when their attributions match.
+//!
 //! Document text that happens to contain a CriticMarkup delimiter is escaped
 //! with a Markdown backslash (`{\++`), which renders as the original characters
 //! but no longer matches the delimiter.
@@ -42,6 +47,10 @@ impl Mark {
     }
 }
 
+/// A tracked change: its kind and who made it when, as the inside of its
+/// `{>>…<<}` note (`Ana Lima (2026-09-29T14:05:00Z)`), already escaped.
+pub(crate) type Change = (Mark, Option<String>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Leaf {
     /// Document text: escaped when rendered.
@@ -60,14 +69,14 @@ enum Leaf {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Leaf(Leaf),
-    Open(Mark),
+    Open(Mark, Option<String>),
     Close(Mark),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Node {
     Leaf(Leaf),
-    Span(Mark, Vec<Node>),
+    Span(Mark, Option<String>, Vec<Node>),
 }
 
 impl Node {
@@ -75,7 +84,7 @@ impl Node {
         match self {
             Self::Leaf(Leaf::Comment(_)) => false,
             Self::Leaf(_) => true,
-            Self::Span(_, children) => children.iter().any(Self::has_content),
+            Self::Span(_, _, children) => children.iter().any(Self::has_content),
         }
     }
 }
@@ -110,12 +119,25 @@ impl Critic {
             .push(Token::Leaf(Leaf::Comment(note.to_string())));
     }
 
-    pub(crate) fn open(&mut self, mark: Mark) {
-        self.tokens.push(Token::Open(mark));
+    /// Opens a span; `by` is the attribution of an insertion or deletion.
+    pub(crate) fn open(&mut self, mark: Mark, by: Option<&str>) {
+        self.tokens.push(Token::Open(mark, by.map(str::to_string)));
     }
 
     pub(crate) fn close(&mut self, mark: Mark) {
         self.tokens.push(Token::Close(mark));
+    }
+
+    /// Drops every attribution. Inside a comment's own text an attribution would
+    /// put a `{>>…<<}` inside another, and the outer one would end at the inner
+    /// closer.
+    pub(crate) fn unattributed(mut self) -> Self {
+        for token in &mut self.tokens {
+            if let Token::Open(_, by) = token {
+                *by = None;
+            }
+        }
+        self
     }
 
     /// True when there is no visible text and no comment.
@@ -123,7 +145,7 @@ impl Critic {
         self.tokens.iter().all(|token| match token {
             Token::Leaf(Leaf::Text { text, .. } | Leaf::Raw(text)) => text.trim().is_empty(),
             Token::Leaf(Leaf::Comment(_)) => false,
-            Token::Open(_) | Token::Close(_) => true,
+            Token::Open(..) | Token::Close(_) => true,
         })
     }
 
@@ -134,28 +156,35 @@ impl Critic {
     }
 }
 
+/// A span still open while the tree is built.
+type Open = (Mark, Option<String>, Vec<Node>);
+
 /// Builds well-nested spans from flat tokens. A span of a kind that is already
-/// open is merged into the open one; a close that would cross other spans closes
-/// them first and opens them again after it. Spans still open at the end close.
+/// open is merged into the open one, which keeps its attribution; a close that
+/// would cross other spans closes them first and opens them again after it,
+/// with the same attribution. Spans still open at the end close.
 fn tree(tokens: Vec<Token>) -> Vec<Node> {
     let mut root = Vec::new();
-    let mut open: Vec<(Mark, Vec<Node>)> = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
     let mut merged = [0usize; 3];
     for token in tokens {
         match token {
             Token::Leaf(leaf) => children(&mut root, &mut open).push(Node::Leaf(leaf)),
-            Token::Open(mark) if open.iter().any(|(m, _)| *m == mark) => {
+            Token::Open(mark, _) if open.iter().any(|(m, ..)| *m == mark) => {
                 merged[mark.index()] += 1;
             }
-            Token::Open(mark) => open.push((mark, Vec::new())),
+            Token::Open(mark, by) => open.push((mark, by, Vec::new())),
             Token::Close(mark) if merged[mark.index()] > 0 => merged[mark.index()] -= 1,
             Token::Close(mark) => {
-                let Some(at) = open.iter().position(|(m, _)| *m == mark) else {
+                let Some(at) = open.iter().position(|(m, ..)| *m == mark) else {
                     continue;
                 };
-                let reopen: Vec<Mark> = open[at + 1..].iter().map(|(m, _)| *m).collect();
+                let reopen: Vec<(Mark, Option<String>)> = open[at + 1..]
+                    .iter()
+                    .map(|(m, by, _)| (*m, by.clone()))
+                    .collect();
                 close_from(&mut root, &mut open, at);
-                open.extend(reopen.into_iter().map(|m| (m, Vec::new())));
+                open.extend(reopen.into_iter().map(|(m, by)| (m, by, Vec::new())));
             }
         }
     }
@@ -163,32 +192,32 @@ fn tree(tokens: Vec<Token>) -> Vec<Node> {
     root
 }
 
-fn children<'a>(root: &'a mut Vec<Node>, open: &'a mut [(Mark, Vec<Node>)]) -> &'a mut Vec<Node> {
+fn children<'a>(root: &'a mut Vec<Node>, open: &'a mut [Open]) -> &'a mut Vec<Node> {
     match open.last_mut() {
-        Some((_, nodes)) => nodes,
+        Some((_, _, nodes)) => nodes,
         None => root,
     }
 }
 
 /// Closes the open spans from index `at` up, innermost first, into their parent.
-fn close_from(root: &mut Vec<Node>, open: &mut Vec<(Mark, Vec<Node>)>, at: usize) {
+fn close_from(root: &mut Vec<Node>, open: &mut Vec<Open>, at: usize) {
     let closed = open.split_off(at);
     let outermost = closed
         .into_iter()
         .rev()
-        .fold(None, |inner, (mark, mut nodes)| {
+        .fold(None, |inner, (mark, by, mut nodes)| {
             nodes.extend(inner);
-            Some(Node::Span(mark, nodes))
+            Some(Node::Span(mark, by, nodes))
         });
     children(root, open).extend(outermost);
 }
 
-/// Drops empty spans, joins neighbours of the same kind and moves comments out
-/// of highlights, at every level.
+/// Drops empty spans, joins neighbours of the same kind and attribution, and
+/// moves comments out of highlights, at every level.
 fn tidy(nodes: Vec<Node>) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::new();
     for node in nodes {
-        let Node::Span(mark, nodes) = node else {
+        let Node::Span(mark, by, nodes) = node else {
             out.push(node);
             continue;
         };
@@ -200,19 +229,19 @@ fn tidy(nodes: Vec<Node>) -> Vec<Node> {
         };
         if !nodes.iter().any(Node::has_content) {
             lift_comments(nodes, &mut out);
-        } else if let Some(Node::Span(_, before)) = out
+        } else if let Some(Node::Span(.., before)) = out
             .last_mut()
-            .filter(|last| matches!(last, Node::Span(m, _) if *m == mark))
+            .filter(|last| matches!(last, Node::Span(m, b, _) if *m == mark && *b == by))
         {
             before.extend(nodes);
         } else {
-            out.push(Node::Span(mark, nodes));
+            out.push(Node::Span(mark, by, nodes));
         }
         out.extend(comments);
     }
     out.into_iter()
         .map(|node| match node {
-            Node::Span(mark, nodes) => Node::Span(mark, tidy(nodes)),
+            Node::Span(mark, by, nodes) => Node::Span(mark, by, tidy(nodes)),
             leaf => leaf,
         })
         .collect()
@@ -224,7 +253,9 @@ fn lift_comments(nodes: Vec<Node>, comments: &mut Vec<Node>) -> Vec<Node> {
     for node in nodes {
         match node {
             Node::Leaf(Leaf::Comment(_)) => comments.push(node),
-            Node::Span(mark, nodes) => kept.push(Node::Span(mark, lift_comments(nodes, comments))),
+            Node::Span(mark, by, nodes) => {
+                kept.push(Node::Span(mark, by, lift_comments(nodes, comments)));
+            }
             leaf => kept.push(leaf),
         }
     }
@@ -235,21 +266,32 @@ fn render(nodes: &[Node], out: &mut Inline) {
     let mut index = 0;
     while index < nodes.len() {
         match (&nodes[index], nodes.get(index + 1)) {
-            (Node::Span(Mark::Deletion, old), Some(Node::Span(Mark::Insertion, new)))
-            | (Node::Span(Mark::Insertion, new), Some(Node::Span(Mark::Deletion, old))) => {
+            (
+                Node::Span(Mark::Deletion, old_by, old),
+                Some(Node::Span(Mark::Insertion, new_by, new)),
+            )
+            | (
+                Node::Span(Mark::Insertion, new_by, new),
+                Some(Node::Span(Mark::Deletion, old_by, old)),
+            ) => {
                 marker(out, "{~~");
                 render(old, out);
                 marker(out, "~>");
                 render(new, out);
                 marker(out, "~~}");
+                attribution(out, old_by.as_deref());
+                if new_by != old_by {
+                    attribution(out, new_by.as_deref());
+                }
                 index += 2;
                 continue;
             }
-            (Node::Span(mark, nodes), _) => {
+            (Node::Span(mark, by, nodes), _) => {
                 let (open, close) = mark.delimiters();
                 marker(out, open);
                 render(nodes, out);
                 marker(out, close);
+                attribution(out, by.as_deref());
             }
             (
                 Node::Leaf(Leaf::Text {
@@ -263,7 +305,7 @@ fn render(nodes: &[Node], out: &mut Inline) {
                 out.push(&escape(text), *bold, *italic, link.as_deref());
             }
             (Node::Leaf(Leaf::Raw(markdown)), _) => marker(out, markdown),
-            (Node::Leaf(Leaf::Comment(note)), _) => marker(out, &format!("{{>>{note}<<}}")),
+            (Node::Leaf(Leaf::Comment(inner)), _) => marker(out, &note(inner)),
         }
         index += 1;
     }
@@ -271,6 +313,16 @@ fn render(nodes: &[Node], out: &mut Inline) {
 
 fn marker(out: &mut Inline, text: &str) {
     out.push(text, false, false, None);
+}
+
+fn attribution(out: &mut Inline, by: Option<&str>) {
+    if let Some(by) = by {
+        marker(out, &note(by));
+    }
+}
+
+fn note(inner: &str) -> String {
+    format!("{{>>{inner}<<}}")
 }
 
 /// Breaks every CriticMarkup delimiter in document text with a Markdown
@@ -299,40 +351,51 @@ pub(crate) fn escape(text: &str) -> String {
 
 /// Appends `prefix` and `body` to `out` after `separator`. When the separator is
 /// itself tracked (a paragraph mark that was inserted or deleted), it is marked
-/// the way the CriticMarkup spec marks a paragraph break (`{++\n\n++}`), and an
-/// adjoining span of the same kind is extended rather than opened twice.
+/// the way the CriticMarkup spec marks a paragraph break (`{++\n\n++}`), with
+/// its attribution after it. An adjoining span of the same kind and attribution
+/// is extended rather than opened twice.
 pub(crate) fn splice(
     out: &mut String,
     separator: &str,
     prefix: &str,
     body: &str,
-    mark: Option<Mark>,
+    change: Option<&Change>,
 ) {
-    let Some(mark) = mark else {
+    let Some((mark, by)) = change else {
         out.push_str(separator);
         out.push_str(prefix);
         out.push_str(body);
         return;
     };
     let (open, close) = mark.delimiters();
-    match out.strip_suffix(close) {
+    let by = by.as_deref().map(note).unwrap_or_default();
+    let end = format!("{close}{by}");
+    match out.strip_suffix(end.as_str()) {
         Some(kept) => out.truncate(kept.len()),
         None => out.push_str(open),
     }
     out.push_str(separator);
     out.push_str(prefix);
-    match body.strip_prefix(open) {
+    // The body's first span continues this one when it is of the same kind and
+    // its closer carries the same attribution. Escaped text cannot contain the
+    // closer, and a span never nests one of its own kind, so the first closer
+    // after the opener is that span's own.
+    let continues = body.strip_prefix(open).filter(|rest| {
+        rest.find(close)
+            .is_some_and(|at| rest[at + close.len()..].starts_with(by.as_str()))
+    });
+    match continues {
         Some(rest) => out.push_str(rest),
         None => {
-            out.push_str(close);
+            out.push_str(&end);
             out.push_str(body);
         }
     }
 }
 
-/// Joins paragraphs, each paired with the revision of the paragraph mark that
-/// ends it. A blank paragraph drops the pending mark: its own break stays.
-pub(crate) fn join_marked(parts: Vec<(String, Option<Mark>)>, separator: &str) -> String {
+/// Joins paragraphs, each paired with the tracked change on the paragraph mark
+/// that ends it. A blank paragraph drops the pending change: its own break stays.
+pub(crate) fn join_marked(parts: Vec<(String, Option<Change>)>, separator: &str) -> String {
     let mut out = String::new();
     let mut pending = None;
     for (part, mark) in parts {
@@ -343,7 +406,7 @@ pub(crate) fn join_marked(parts: Vec<(String, Option<Mark>)>, separator: &str) -
         if out.is_empty() {
             out = part;
         } else {
-            splice(&mut out, separator, "", &part, pending);
+            splice(&mut out, separator, "", &part, pending.as_ref());
         }
         pending = mark;
     }
@@ -369,7 +432,9 @@ mod tests {
         let mut critic = Critic::default();
         for (op, value) in steps {
             match *op {
-                "open" => critic.open(kind(value)),
+                "open" => critic.open(kind(value), None),
+                // `by+Ana (d)`: an insertion or deletion made by Ana at d.
+                op if op.starts_with("by") => critic.open(kind(&op[2..]), Some(value)),
                 "close" => critic.close(kind(value)),
                 "note" => critic.comment(value),
                 "raw" => critic.raw(value),
@@ -627,11 +692,11 @@ mod tests {
     #[test]
     fn formatting_and_links_stay_inside_the_markers() {
         let mut critic = Critic::default();
-        critic.open(Ins);
+        critic.open(Ins, None);
         critic.push("bold", true, false, None);
         critic.close(Ins);
         critic.push(" ", false, false, None);
-        critic.open(Del);
+        critic.open(Del, None);
         critic.push("site", false, false, Some("https://x.test"));
         critic.close(Del);
         critic.push("", false, false, None);
@@ -641,7 +706,7 @@ mod tests {
     #[test]
     fn blankness_ignores_markers_but_not_comments() {
         let mut critic = Critic::default();
-        critic.open(Ins);
+        critic.open(Ins, None);
         text(&mut critic, "  ");
         critic.raw(" ");
         critic.close(Ins);
@@ -670,9 +735,9 @@ mod tests {
 
     #[test]
     fn splice_marks_a_tracked_break_and_extends_adjacent_spans() {
-        let join = |out: &str, body: &str, mark| {
+        let join = |out: &str, body: &str, mark: Option<Mark>| {
             let mut out = out.to_string();
-            splice(&mut out, "\n\n", "", body, mark);
+            splice(&mut out, "\n\n", "", body, mark.map(|m| (m, None)).as_ref());
             out
         };
         assert_eq!(join("A", "B", None), "A\n\nB");
@@ -687,21 +752,170 @@ mod tests {
         // An escaped delimiter in the text is not a span to extend.
         assert_eq!(join("a --\\}", "b", Some(Del)), "a --\\}{--\n\n--}b");
         let mut heading = "A".to_string();
-        splice(&mut heading, "\n\n", "## ", "B", Some(Ins));
+        splice(&mut heading, "\n\n", "## ", "B", Some(&(Ins, None)));
         assert_eq!(heading, "A{++\n\n## ++}B");
     }
 
     #[test]
     fn join_marked_uses_each_paragraph_mark_and_resets_on_blanks() {
         let parts = vec![
-            ("a".to_string(), Some(Del)),
+            ("a".to_string(), Some((Del, None))),
             ("b".to_string(), None),
-            ("c".to_string(), Some(Ins)),
-            ("  ".to_string(), Some(Del)),
-            ("d".to_string(), Some(Del)),
+            ("c".to_string(), Some((Ins, None))),
+            ("  ".to_string(), Some((Del, None))),
+            ("d".to_string(), Some((Del, None))),
         ];
         assert_eq!(join_marked(parts, " "), "a{-- --}b c d");
         assert_eq!(join_marked(Vec::new(), " "), "");
+    }
+
+    #[test]
+    fn each_change_is_followed_by_its_author_and_date() {
+        let steps = [
+            ("by+", "Ana (2026-01-02T03:04:00Z)"),
+            ("t", "new"),
+            ("close", "+"),
+            ("t", " and "),
+            ("by-", "Bo"),
+            ("t", "old"),
+            ("close", "-"),
+            ("t", "."),
+        ];
+        assert_eq!(
+            script(&steps),
+            "{++new++}{>>Ana (2026-01-02T03:04:00Z)<<} and {--old--}{>>Bo<<}."
+        );
+    }
+
+    #[test]
+    fn a_substitution_names_one_author_or_both() {
+        let same = [
+            ("by-", "Ana"),
+            ("t", "old"),
+            ("close", "-"),
+            ("by+", "Ana"),
+            ("t", "new"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&same), "{~~old~>new~~}{>>Ana<<}");
+        // Insertion first still reads old ~> new, and each author follows in
+        // the order of old then new.
+        let different = [
+            ("by+", "Bo"),
+            ("t", "new"),
+            ("close", "+"),
+            ("by-", "Ana"),
+            ("t", "old"),
+            ("close", "-"),
+        ];
+        assert_eq!(script(&different), "{~~old~>new~~}{>>Ana<<}{>>Bo<<}");
+        let one_side = [
+            ("open", "-"),
+            ("t", "old"),
+            ("close", "-"),
+            ("by+", "Bo"),
+            ("t", "new"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&one_side), "{~~old~>new~~}{>>Bo<<}");
+        let other_side = [
+            ("by-", "Ana"),
+            ("t", "old"),
+            ("close", "-"),
+            ("open", "+"),
+            ("t", "new"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&other_side), "{~~old~>new~~}{>>Ana<<}");
+    }
+
+    #[test]
+    fn neighbours_join_only_when_made_by_the_same_person_at_the_same_time() {
+        let same = [
+            ("by+", "Ana"),
+            ("t", "a"),
+            ("close", "+"),
+            ("by+", "Ana"),
+            ("t", "b"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&same), "{++ab++}{>>Ana<<}");
+        let different = [
+            ("by+", "Ana"),
+            ("t", "a"),
+            ("close", "+"),
+            ("by+", "Bo"),
+            ("t", "b"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&different), "{++a++}{>>Ana<<}{++b++}{>>Bo<<}");
+    }
+
+    #[test]
+    fn attributions_stay_with_their_change_inside_a_highlight() {
+        // A Word comment moves after the highlight; the attribution does not.
+        let steps = [
+            ("open", "="),
+            ("t", "a"),
+            ("by+", "Bo"),
+            ("t", "b"),
+            ("close", "+"),
+            ("note", "Ana: why?"),
+            ("close", "="),
+        ];
+        assert_eq!(script(&steps), "{==a{++b++}{>>Bo<<}==}{>>Ana: why?<<}");
+    }
+
+    #[test]
+    fn merged_nesting_keeps_the_outer_author_and_split_spans_keep_theirs() {
+        let nested = [
+            ("by-", "Row"),
+            ("t", "a"),
+            ("by-", "Run"),
+            ("t", "b"),
+            ("close", "-"),
+            ("close", "-"),
+        ];
+        assert_eq!(script(&nested), "{--ab--}{>>Row<<}");
+        let crossing = [
+            ("open", "="),
+            ("t", "a"),
+            ("by+", "Bo"),
+            ("t", "b"),
+            ("close", "="),
+            ("t", "c"),
+            ("close", "+"),
+        ];
+        assert_eq!(script(&crossing), "{==a{++b++}{>>Bo<<}==}{++c++}{>>Bo<<}");
+        // An empty change leaves no attribution behind.
+        assert_eq!(script(&[("t", "x"), ("by+", "Bo"), ("close", "+")]), "x");
+    }
+
+    #[test]
+    fn a_tracked_break_extends_spans_only_by_the_same_person() {
+        let join = |out: &str, body: &str, change: Option<Change>| {
+            let mut out = out.to_string();
+            splice(&mut out, "\n\n", "", body, change.as_ref());
+            out
+        };
+        let ana = || Some((Del, Some("Ana".to_string())));
+        assert_eq!(join("A", "B", ana()), "A{--\n\n--}{>>Ana<<}B");
+        assert_eq!(
+            join("{--A--}{>>Ana<<}", "{--B--}{>>Ana<<} rest", ana()),
+            "{--A\n\nB--}{>>Ana<<} rest"
+        );
+        // Someone else's deletion on either side stays its own span.
+        assert_eq!(
+            join("{--A--}{>>Bo<<}", "{--B--}{>>Bo<<}", ana()),
+            "{--A--}{>>Bo<<}{--\n\n--}{>>Ana<<}{--B--}{>>Bo<<}"
+        );
+        // A body span of the same kind whose closer is followed by nothing
+        // attributed is not the same change.
+        assert_eq!(
+            join("A", "{--B--} rest", ana()),
+            "A{--\n\n--}{>>Ana<<}{--B--} rest"
+        );
+        assert_eq!(join("A", "{--B", ana()), "A{--\n\n--}{>>Ana<<}{--B");
     }
 
     #[test]

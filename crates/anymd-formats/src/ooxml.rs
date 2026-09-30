@@ -8,7 +8,7 @@ use std::io::{Cursor, Read};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::critic::{self, Mark};
+use crate::critic::{self, Change};
 use crate::ConvertError;
 
 /// Largest uncompressed zip entry we will inflate.
@@ -688,7 +688,7 @@ pub(crate) struct Blocks {
     out: String,
     last_was_list: bool,
     /// A tracked change on the break before the next block.
-    separator: Option<Mark>,
+    separator: Option<Change>,
 }
 
 impl Blocks {
@@ -715,7 +715,7 @@ impl Blocks {
         if body.trim().is_empty() {
             return;
         }
-        let mark = self.separator.take();
+        let change = self.separator.take();
         if self.out.is_empty() {
             self.out.push_str(prefix);
             self.out.push_str(body);
@@ -725,15 +725,15 @@ impl Blocks {
             } else {
                 "\n\n"
             };
-            critic::splice(&mut self.out, separator, prefix, body, mark);
+            critic::splice(&mut self.out, separator, prefix, body, change.as_ref());
         }
         self.last_was_list = is_list;
     }
 
     /// Records that the paragraph mark ending the last block was inserted or
     /// deleted (`None` clears it).
-    pub(crate) fn set_separator(&mut self, mark: Option<Mark>) {
-        self.separator = mark;
+    pub(crate) fn set_separator(&mut self, change: Option<Change>) {
+        self.separator = change;
     }
 
     pub(crate) fn finish(self) -> String {
