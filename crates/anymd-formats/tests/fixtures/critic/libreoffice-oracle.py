@@ -1,35 +1,105 @@
 #!/usr/bin/python3
-"""Writes LibreOffice Writer's accept-all and reject-all text of a .docx.
+"""Write LibreOffice Writer's accept-all and reject-all text of a .docx.
 
 Usage: /usr/bin/python3 libreoffice-oracle.py FILE.docx PROFILE_DIR
 
-Needs LibreOffice Writer and its Python bridge (python3-uno), so it runs with the
-system Python rather than uv. Output: FILE.accepted.txt and FILE.rejected.txt.
+Needs LibreOffice Writer and its Python bridge (python3-uno), so it runs with
+the system Python rather than uv. Output: FILE.accepted.txt and
+FILE.rejected.txt next to FILE.docx.
 """
-import subprocess, sys, time, uno
-from com.sun.star.beans import PropertyValue
 
-def prop(name, value):
-    p = PropertyValue(); p.Name = name; p.Value = value; return p
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
 
-office = subprocess.Popen(["soffice", "-env:UserInstallation=file://" + sys.argv[2], "--headless", "--norestore",
-                           "--accept=socket,host=127.0.0.1,port=2099;urp;"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-local = uno.getComponentContext()
-resolver = local.ServiceManager.createInstanceWithContext("com.sun.star.bridge.UnoUrlResolver", local)
-for _ in range(60):
+import uno
+
+# pyuno creates the com.sun.star modules at import time, so type checkers
+# cannot see them; getClass returns the same classes.
+PropertyValue = uno.getClass("com.sun.star.beans.PropertyValue")
+NoConnectException = uno.getClass("com.sun.star.connection.NoConnectException")
+
+PORT = 2099
+COMMANDS = {
+    "accepted": ".uno:AcceptAllTrackedChanges",
+    "rejected": ".uno:RejectAllTrackedChanges",
+}
+# XCloseable.close(DeliverOwnership): the caller keeps no reference afterwards.
+DELIVER_OWNERSHIP = True
+
+
+def prop(name: str, *, value: object) -> Any:
+    """Build a com.sun.star.beans.PropertyValue for a load or dispatch call."""
+    property_value = PropertyValue()
+    property_value.Name = name
+    property_value.Value = value
+    return property_value
+
+
+def connect(attempts: int = 60) -> Any:
+    """Return the context of the office started on PORT, once it listens."""
+    local = uno.getComponentContext()
+    resolver = local.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", local
+    )
+    url = f"uno:socket,host=127.0.0.1,port={PORT};urp;StarOffice.ComponentContext"
+    for _ in range(attempts):
+        try:
+            return resolver.resolve(url)
+        except NoConnectException:
+            time.sleep(1)
+    message = f"LibreOffice did not listen on port {PORT}"
+    raise SystemExit(message)
+
+
+def main(document: Path, profile: Path) -> None:
+    """Write the accepted and rejected text of `document` beside it."""
+    if document.suffix != ".docx" or not document.is_file():
+        message = f"not a .docx file: {document}"
+        raise SystemExit(message)
+    soffice = shutil.which("soffice")
+    if soffice is None:
+        message = "soffice is not on PATH"
+        raise SystemExit(message)
+    office = subprocess.Popen(  # noqa: S603 - fixed argv, no shell; the paths are the caller's own
+        [
+            soffice,
+            f"-env:UserInstallation={profile.resolve().as_uri()}",
+            "--headless",
+            "--norestore",
+            f"--accept=socket,host=127.0.0.1,port={PORT};urp;",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     try:
-        ctx = resolver.resolve("uno:socket,host=127.0.0.1,port=2099;urp;StarOffice.ComponentContext"); break
-    except Exception:
-        time.sleep(1)
-smgr = ctx.ServiceManager
-desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
-dispatcher = smgr.createInstanceWithContext("com.sun.star.frame.DispatchHelper", ctx)
-url = uno.systemPathToFileUrl(sys.argv[1])
-for command in ("AcceptAllTrackedChanges", "RejectAllTrackedChanges"):
-    doc = desktop.loadComponentFromURL(url, "_blank", 0, (prop("Hidden", True),))
-    dispatcher.executeDispatch(doc.getCurrentController().getFrame(), ".uno:" + command, "", 0, ())
-    suffix = "accepted" if command.startswith("Accept") else "rejected"
-    with open(sys.argv[1].removesuffix(".docx") + f".{suffix}.txt", "w", encoding="utf-8") as out:
-        out.write(doc.getText().getString().replace("\r\n", "\n") + "\n")
-    doc.close(True)
-office.terminate()
+        context = connect()
+        manager = context.ServiceManager
+        desktop = manager.createInstanceWithContext(
+            "com.sun.star.frame.Desktop", context
+        )
+        dispatcher = manager.createInstanceWithContext(
+            "com.sun.star.frame.DispatchHelper", context
+        )
+        url = document.resolve().as_uri()
+        for suffix, command in COMMANDS.items():
+            doc = desktop.loadComponentFromURL(
+                url, "_blank", 0, (prop("Hidden", value=True),)
+            )
+            dispatcher.executeDispatch(
+                doc.getCurrentController().getFrame(), command, "", 0, ()
+            )
+            text = doc.getText().getString().replace("\r\n", "\n")
+            document.with_suffix(f".{suffix}.txt").write_text(
+                text + "\n", encoding="utf-8"
+            )
+            doc.close(DELIVER_OWNERSHIP)
+    finally:
+        office.terminate()
+
+
+if __name__ == "__main__":
+    main(Path(sys.argv[1]), Path(sys.argv[2]))
