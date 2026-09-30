@@ -315,6 +315,24 @@ struct Field {
     link: Option<String>,
 }
 
+/// How Word represents tracked changes in WordprocessingML. Moves are rendered
+/// as an insertion at their destination and a deletion at their source, which
+/// is the same lossless representation used by CriticMarkup (and pandiff).
+#[derive(Clone, Copy)]
+enum Revision {
+    Insertion,
+    Deletion,
+}
+
+impl Revision {
+    fn markers(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Insertion => ("{++", "++}"),
+            Self::Deletion => ("{--", "--}"),
+        }
+    }
+}
+
 struct Writer<'a> {
     rels: &'a Rels,
     styles: Styles,
@@ -328,28 +346,50 @@ struct Writer<'a> {
 
 impl Writer<'_> {
     fn blocks(&mut self, container: &Element, blocks: &mut Blocks, list: &mut ListIndent) {
+        self.blocks_revised(container, blocks, list, None);
+    }
+
+    fn blocks_revised(
+        &mut self,
+        container: &Element,
+        blocks: &mut Blocks,
+        list: &mut ListIndent,
+        revision: Option<Revision>,
+    ) {
         for child in container.elements() {
             match child.local() {
-                "p" => self.paragraph(child, blocks, list),
+                "p" => self.paragraph(child, blocks, list, revision),
                 "tbl" => {
                     list.reset();
-                    let table = self.table(child);
+                    let table = self.table(child, revision);
                     blocks.push(&table, false);
                 }
                 "sdt" => {
                     if let Some(content) = child.child("sdtContent") {
-                        self.blocks(content, blocks, list);
+                        self.blocks_revised(content, blocks, list, revision);
                     }
                 }
-                "customXml" | "ins" | "moveTo" | "sdtContent" | "txbxContent" => {
-                    self.blocks(child, blocks, list)
+                "ins" | "moveTo" => {
+                    self.blocks_revised(child, blocks, list, revision.or(Some(Revision::Insertion)))
+                }
+                "del" | "moveFrom" => {
+                    self.blocks_revised(child, blocks, list, revision.or(Some(Revision::Deletion)))
+                }
+                "customXml" | "sdtContent" | "txbxContent" => {
+                    self.blocks_revised(child, blocks, list, revision)
                 }
                 _ => {}
             }
         }
     }
 
-    fn paragraph(&mut self, p: &Element, blocks: &mut Blocks, list: &mut ListIndent) {
+    fn paragraph(
+        &mut self,
+        p: &Element,
+        blocks: &mut Blocks,
+        list: &mut ListIndent,
+        revision: Option<Revision>,
+    ) {
         let ppr = p.child("pPr");
         let style = ppr
             .and_then(|pr| pr.child("pStyle"))
@@ -373,17 +413,18 @@ impl Writer<'_> {
         if !inline.is_blank() {
             if let Some(level) = heading {
                 list.reset();
-                let text = inline.render(false).replace('\n', " ");
+                let text = mark_revision(inline.render(false).replace('\n', " "), revision);
                 blocks.push(&format!("{} {text}", "#".repeat(level)), false);
             } else if let Some(marker) =
                 num.and_then(|(id, ilvl)| self.list_marker(&id, ilvl.min(8)).map(|m| (m, ilvl)))
             {
                 let (marker, ilvl) = marker;
-                let item = list.item(ilvl, &marker, &inline.render(true));
+                let text = mark_revision(inline.render(true), revision);
+                let item = list.item(ilvl, &marker, &text);
                 blocks.push(&item, true);
             } else {
                 list.reset();
-                blocks.push(&inline.render(true), false);
+                blocks.push(&mark_revision(inline.render(true), revision), false);
             }
         }
         for block in extra {
@@ -460,8 +501,15 @@ impl Writer<'_> {
                     let url = child.attr("instr").and_then(hyperlink_instruction);
                     self.inline(child, url.as_deref().or(link), base, fields, out, extra);
                 }
-                "ins" | "smartTag" | "customXml" | "sdt" | "sdtContent" | "moveTo" | "bdo"
-                | "dir" => self.inline(child, link, base, fields, out, extra),
+                "ins" | "moveTo" => {
+                    self.revision_inline(child, Revision::Insertion, link, base, fields, out, extra)
+                }
+                "del" | "moveFrom" => {
+                    self.revision_inline(child, Revision::Deletion, link, base, fields, out, extra)
+                }
+                "smartTag" | "customXml" | "sdt" | "sdtContent" | "bdo" | "dir" => {
+                    self.inline(child, link, base, fields, out, extra)
+                }
                 "oMathPara" => {
                     let equations: Vec<String> = child
                         .children_named("oMath")
@@ -486,6 +534,23 @@ impl Writer<'_> {
                 _ => {}
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn revision_inline(
+        &mut self,
+        container: &Element,
+        revision: Revision,
+        link: Option<&str>,
+        base: (bool, bool),
+        fields: &mut Vec<Field>,
+        out: &mut Inline,
+        extra: &mut Vec<String>,
+    ) {
+        let (open, close) = revision.markers();
+        out.push(open, false, false, None);
+        self.inline(container, link, base, fields, out, extra);
+        out.push(close, false, false, None);
     }
 
     fn run(
@@ -532,7 +597,7 @@ impl Writer<'_> {
         let field_link = fields.iter().rev().find_map(|f| f.link.clone());
         let link = field_link.as_deref().or(link);
         match child.local() {
-            "t" if !hidden => out.push(&child.text(), bold, italic, link),
+            "t" | "delText" if !hidden => out.push(&child.text(), bold, italic, link),
             "tab" | "ptab" if !hidden => out.push("\t", bold, italic, link),
             "br" | "cr" if !hidden => {
                 if child.attr("type") != Some("page") {
@@ -616,10 +681,11 @@ impl Writer<'_> {
         }
     }
 
-    fn table(&mut self, table: &Element) -> String {
+    fn table(&mut self, table: &Element, revision: Option<Revision>) -> String {
         let mut rows = Vec::new();
         for tr in table_rows(table) {
             let mut row = Vec::new();
+            let row_revision = tr.child("trPr").and_then(revision_property);
             let before = tr
                 .path(&["trPr", "gridBefore"])
                 .and_then(|g| g.attr("val"))
@@ -627,7 +693,11 @@ impl Writer<'_> {
                 .unwrap_or(0);
             row.extend(std::iter::repeat_n(String::new(), before.min(64)));
             for tc in row_cells(tr) {
-                row.push(self.cell_text(tc));
+                let cell_revision = tc.child("tcPr").and_then(revision_property);
+                row.push(mark_revision(
+                    self.cell_text(tc),
+                    cell_revision.or(row_revision).or(revision),
+                ));
                 let span = tc
                     .path(&["tcPr", "gridSpan"])
                     .and_then(|g| g.attr("val"))
@@ -680,10 +750,50 @@ impl Writer<'_> {
                         parts.push(cells.join("; "));
                     }
                 }
-                "sdt" | "sdtContent" | "customXml" | "ins" => self.cell_parts(child, parts),
+                "ins" | "moveTo" => {
+                    let start = parts.len();
+                    self.cell_parts(child, parts);
+                    mark_parts(parts, start, Revision::Insertion);
+                }
+                "del" | "moveFrom" => {
+                    let start = parts.len();
+                    self.cell_parts(child, parts);
+                    mark_parts(parts, start, Revision::Deletion);
+                }
+                "sdt" | "sdtContent" | "customXml" => self.cell_parts(child, parts),
                 _ => {}
             }
         }
+    }
+}
+
+fn mark_revision(text: String, revision: Option<Revision>) -> String {
+    let Some(revision) = revision else {
+        return text;
+    };
+    if text.trim().is_empty() {
+        return text;
+    }
+    let (open, close) = revision.markers();
+    format!("{open}{text}{close}")
+}
+
+fn mark_parts(parts: &mut Vec<String>, start: usize, revision: Revision) {
+    if start >= parts.len() {
+        return;
+    }
+    let (open, close) = revision.markers();
+    parts[start].insert_str(0, open);
+    parts.last_mut().expect("a part was added").push_str(close);
+}
+
+fn revision_property(properties: &Element) -> Option<Revision> {
+    if properties.child("del").is_some() || properties.child("cellDel").is_some() {
+        Some(Revision::Deletion)
+    } else if properties.child("ins").is_some() || properties.child("cellIns").is_some() {
+        Some(Revision::Insertion)
+    } else {
+        None
     }
 }
 
@@ -1102,6 +1212,56 @@ mod tests {
         assert_eq!(
             md(&bytes),
             "Claim[^1]\n\n[field link](https://f.example)\n\n![A chart of sales](image1.png)\n\n[^1]: Source: survey.\n"
+        );
+    }
+
+    #[test]
+    fn tracked_changes_become_critic_markup_without_losing_formatting() {
+        let body = [
+            p(
+                "",
+                r#"<w:r><w:t xml:space="preserve">Keep </w:t></w:r><w:del w:id="1"><w:r><w:rPr><w:i/></w:rPr><w:delText>old</w:delText></w:r></w:del><w:ins w:id="2"><w:r><w:rPr><w:b/></w:rPr><w:t>new</w:t></w:r></w:ins><w:r><w:t>.</w:t></w:r>"#,
+            ),
+            p(
+                "",
+                r#"<w:moveTo w:id="3"><w:r><w:t>destination</w:t></w:r></w:moveTo><w:r><w:t xml:space="preserve"> / </w:t></w:r><w:moveFrom w:id="3"><w:r><w:delText>source</w:delText></w:r></w:moveFrom>"#,
+            ),
+        ]
+        .concat();
+
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "Keep {--_old_--}{++**new**++}.\n\n{++destination++} / {--source--}\n"
+        );
+    }
+
+    #[test]
+    fn tracked_whole_paragraphs_keep_markdown_block_structure() {
+        let body = format!(
+            r#"<w:ins w:id="1">{}</w:ins><w:del w:id="2">{}</w:del>"#,
+            p("Heading2", &r("Added heading")),
+            p("", &r("Deleted paragraph")),
+        );
+
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "## {++Added heading++}\n\n{--Deleted paragraph--}\n"
+        );
+    }
+
+    #[test]
+    fn tracked_table_rows_and_cells_keep_the_table_valid() {
+        let body = format!(
+            r#"<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}</w:tc></w:tr><w:tr><w:trPr><w:del/></w:trPr><w:tc>{}</w:tc><w:tc><w:tcPr><w:cellIns/></w:tcPr>{}</w:tc></w:tr></w:tbl>"#,
+            p("", &r("Before")),
+            p("", &r("After")),
+            p("", &r("old")),
+            p("", &r("new")),
+        );
+
+        assert_eq!(
+            md(&docx(&body, &[])),
+            "|Before|After|\n|-|-|\n|{--old--}|{++new++}|\n"
         );
     }
 
