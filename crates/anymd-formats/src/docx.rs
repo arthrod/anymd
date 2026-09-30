@@ -88,10 +88,7 @@ pub fn convert(bytes: &[u8], _options: &Options) -> Result<Converted, ConvertErr
     let mut list = ListIndent::default();
     writer.blocks(body, &mut blocks, &mut list);
     // Notes of ranges that ended after the last paragraph.
-    let trailing: String = std::mem::take(&mut writer.pending_notes)
-        .iter()
-        .map(|note| format!("{{>>{note}<<}}"))
-        .collect();
+    let trailing = writer.take_notes();
     blocks.push(&trailing, false);
 
     // Footnotes and endnotes, numbered in reference order. A comment range the
@@ -450,12 +447,24 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
+    /// The notes waiting for the next paragraph, as CriticMarkup comments.
+    fn take_notes(&mut self) -> String {
+        std::mem::take(&mut self.pending_notes)
+            .iter()
+            .map(|note| format!("{{>>{note}<<}}"))
+            .collect()
+    }
+
     fn blocks(&mut self, container: &Element, blocks: &mut Blocks, list: &mut ListIndent) {
         for child in container.elements() {
             match child.local() {
                 "p" => self.paragraph(child, blocks, list),
                 "tbl" => {
                     list.reset();
+                    // A note waiting for the next paragraph would open the
+                    // first cell; it gets its own block before the table.
+                    let notes = self.take_notes();
+                    blocks.push_prefixed("", &notes, false);
                     let table = self.table(child);
                     blocks.push(&table, false);
                 }
@@ -2305,6 +2314,33 @@ mod tests {
         assert_eq!(
             with_comments(&body, &xml),
             "{==a==}\n\n{>>Ana: first<<}b\n\n{==c==}\n\n{>>Bo: last<<}\n"
+        );
+    }
+
+    #[test]
+    fn a_note_between_paragraph_and_table_stays_out_of_the_table() {
+        let xml = comments(&[("1", "Ana", "", &p("", &r("first")))]);
+        let table = |cell: &str| format!("<w:tbl><w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl>");
+        let body = [
+            p("", &format!("{}{}", start("1"), r("a"))),
+            end("1"),
+            table(&p("", &r("cell"))),
+        ]
+        .concat();
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==a==}\n\n{>>Ana: first<<}\n\n|cell|\n|-|\n"
+        );
+        // A deleted paragraph mark before the note keeps its markup.
+        let body = [
+            pm("", &["del"], &format!("{}{}", start("1"), r("a"))),
+            end("1"),
+            table(&p("", &r("cell"))),
+        ]
+        .concat();
+        assert_eq!(
+            with_comments(&body, &xml),
+            "{==a==}{--\n\n--}{>>Ana (2026-01-02T03:04:00Z)<<}{>>Ana: first<<}\n\n|cell|\n|-|\n"
         );
     }
 
