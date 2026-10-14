@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_SOURCES_PER_REQUEST: usize = 32;
 
+// schema_with replaces schemars' Option type detection. Each field using these
+// nullable schemas also needs serde(default) so an omitted key stays optional
+// in the generated input schema, just as it is in the decoder (#881).
 fn option_bool_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     // Keep Option semantics (nullable) while guaranteeing a boolean type keyword for tools/list.
     serde_json::from_value(serde_json::json!({
@@ -71,7 +74,7 @@ pub struct PdfSource {
     pub path: Option<String>,
     #[schemars(
         length(min = 1),
-        description = "URL of the PDF file. Provide exactly one of path or url (not both)."
+        description = "Explicit source URL. Provide exactly one of path or url (not both)."
     )]
     pub url: Option<String>,
     pub pages: Option<PageSpecifier>,
@@ -133,9 +136,13 @@ pub struct ReadPdfArgs {
         description = "Legacy preset switch. true selects balanced (fast plus safety, trust, and accessibility) when profile and auto_detail are omitted. Omit it to use fast. false keeps manual control. auto_detail wins over profile. Never enables OCR."
     )]
     pub auto: Option<bool>,
-    #[schemars(description = "Depth switch that wins over profile: fast, balanced, or full. full adds structure and audits. Never enables OCR or rendering.")]
+    #[schemars(
+        description = "Depth switch that wins over profile: fast, balanced, or full. full adds structure and audits. Never enables OCR or rendering."
+    )]
     pub auto_detail: Option<ReadPdfAutoDetail>,
-    #[schemars(description = "Named preset: fast (default), quality (structure, no audits, no OCR), or research (quality plus safety, trust, and accessibility). Ignored when auto is false or any include_* flag is set.")]
+    #[schemars(
+        description = "Named preset: fast (default), quality (structure, no audits, no OCR), or research (quality plus safety, trust, and accessibility). Ignored when auto is false or any include_* flag is set."
+    )]
     pub profile: Option<String>,
     #[schemars(
         range(min = 1, max = 20),
@@ -188,9 +195,15 @@ impl ReadPdfArgs {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ComparePdfArgs {
-    #[schemars(length(min = 1), description = "Local PDF path for the before document.")]
+    #[schemars(
+        length(min = 1),
+        description = "Local PDF path for the before document."
+    )]
     pub before: String,
-    #[schemars(length(min = 1), description = "Local PDF path for the after document.")]
+    #[schemars(
+        length(min = 1),
+        description = "Local PDF path for the after document."
+    )]
     pub after: String,
     #[schemars(range(min = 1))]
     pub max_file_bytes: Option<u64>,
@@ -236,11 +249,13 @@ pub struct SearchPdfArgs {
         description = "Prefer faster text-index search (omit match geometry; ignored when OCR is enabled).",
         schema_with = "option_bool_schema"
     )]
+    #[serde(default)]
     pub prefer_speed: Option<bool>,
     #[schemars(
         description = "Return the detailed JSON result with match geometry and provenance instead of the compact Markdown list.",
         schema_with = "option_bool_schema"
     )]
+    #[serde(default)]
     pub detail: Option<bool>,
 }
 
@@ -323,12 +338,12 @@ impl PdfEvidenceRegion {
 pub struct PdfEvidenceSource {
     #[schemars(
         length(min = 1),
-        description = "Path to the local PDF file. Provide exactly one of path or url (not both)."
+        description = "Path to a local source (PDF for PDF operations; media for video operations). Provide exactly one of path or url (not both)."
     )]
     pub path: Option<String>,
     #[schemars(
         length(min = 1),
-        description = "URL of the PDF file. Provide exactly one of path or url (not both)."
+        description = "Explicit source URL. Provide exactly one of path or url (not both)."
     )]
     pub url: Option<String>,
     pub pages: Option<PageSpecifier>,
@@ -394,6 +409,10 @@ pub struct PdfEvidenceArgs {
     #[schemars(range(min = 1_000, max = 1_000_000))]
     pub max_output_chars: Option<u32>,
     pub languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Local OCR engine for ocr_pages: auto, vlm, or tesseract. Omit to use the configured command provider."
+    )]
+    pub ocr: Option<crate::ocr_vlm::OcrEngine>,
 }
 
 impl PdfEvidenceArgs {
@@ -513,6 +532,38 @@ mod provider_schema_compat_tests {
     use super::*;
     use schemars::schema_for;
 
+    // Legacy names are callable but are not included in tools/list.
+    #[test]
+    fn legacy_search_optional_overrides_are_not_required() {
+        let schema = serde_json::to_value(schema_for!(SearchPdfArgs)).expect("schema json");
+        assert_eq!(schema["required"], serde_json::json!(["sources", "query"]));
+        let args: SearchPdfArgs = serde_json::from_value(serde_json::json!({
+            "sources": [{"path": "report.pdf"}],
+            "query": "needle"
+        }))
+        .expect("optional search arguments can be omitted");
+        assert!(args.validate().is_ok());
+        for key in ["prefer_speed", "detail"] {
+            assert_eq!(
+                schema["properties"][key]["type"],
+                serde_json::json!(["boolean", "null"])
+            );
+        }
+    }
+
+    #[test]
+    fn read_node_keeps_its_own_description() {
+        let schema = serde_json::to_value(schema_for!(ReadArgs)).unwrap();
+        let properties = &schema["properties"];
+        let node = properties["node"]["description"].as_str().unwrap_or("");
+        assert!(
+            node.contains("section id returned by outline"),
+            "{properties}"
+        );
+        let timeline = properties["timeline"]["description"].as_str().unwrap_or("");
+        assert!(timeline.contains("video"), "{properties}");
+        assert!(!timeline.contains("section id returned by outline"));
+    }
     #[test]
     fn pdf_source_schema_omits_not_required_xor() {
         let schema = schema_for!(PdfSource);
@@ -568,6 +619,12 @@ pub struct ReadArgs {
     )]
     pub source: String,
     #[schemars(
+        description = "Local video only: read this bounded playback window as deterministic timeline sections. end_ms is required; the window is half-open, at most ten minutes and twenty scenes."
+    )]
+    pub timeline: Option<crate::video_request::TimelineSelection>,
+    /// Read a section id returned by outline; repeat node with a continuation cursor.
+    pub node: Option<String>,
+    #[schemars(
         description = "Pages (PDF), slides, sheets, or chapters to read, e.g. \"1-5,8\". Default: all."
     )]
     pub pages: Option<String>,
@@ -579,29 +636,32 @@ pub struct ReadArgs {
     #[schemars(description = "Continue a previous read with the cursor from its last line.")]
     pub cursor: Option<String>,
     #[schemars(
-        description = "OCR images and image-only PDF pages with a local tesseract. Default: automatic when tesseract is installed; false disables.",
-        schema_with = "option_bool_schema"
+        description = "Local OCR: auto, vlm, or tesseract. Auto uses the installed doc-VLM engine and weights (`anymd setup ocr` installs both, an explicit opt-in), otherwise tesseract. vlm without that setup returns a one-line setup notice. No automatic downloads. Boolean false disables; true retains automatic OCR."
     )]
-    pub ocr: Option<bool>,
+    pub ocr: Option<crate::ocr_vlm::OcrSelection>,
     #[schemars(
-        description = "Transcribe audio/video with a local whisper.cpp. Uses ANYMD_WHISPER_MODEL or a model in the anymd cache. Default false.",
+        description = "Transcribe audio/video locally with bundled transcribe-cpp and Qwen3-ASR-1.7B Q8. Needs preinstalled SHA-256 pinned weights (~2.2 GB), unless download_asr_model is true. Audio stays local. Default false.",
         schema_with = "option_bool_schema"
     )]
+    #[serde(default)]
     pub transcript: Option<bool>,
     #[schemars(
-        description = "Implies transcript. When no whisper model is installed, download ggml base.en (~148 MB, SHA-256 verified; ANYMD_WHISPER_MODEL_SIZE picks tiny/base/small) into the anymd cache first. Default false.",
+        description = "Implies transcript. Downloads pinned Qwen3-ASR-1.7B Q8 weights (~2.2 GB) into the anymd cache. Downloads only when explicitly enabled. Legacy download_whisper_model is accepted as an alias. Default false.",
         schema_with = "option_bool_schema"
     )]
-    pub download_whisper_model: Option<bool>,
+    #[serde(default, alias = "download_whisper_model")]
+    pub download_asr_model: Option<bool>,
     #[schemars(
         description = "Images embedded inside PDFs, DOCX, PPTX and EPUB files. \"refs\" (default) saves each meaningful raster image once to the anymd cache and marks its place in the Markdown as ![caption](absolute path) plus an <!-- image: WxH, page N --> comment, so you can open the file yourself; logos, icons and repeated headers are skipped. \"none\" leaves images out. Standalone image files are not affected.",
         schema_with = "option_images_schema"
     )]
+    #[serde(default)]
     pub images: Option<String>,
     #[schemars(
         description = "Tracked changes and comments in Word (DOCX) files. \"markup\" (default) shows them as CriticMarkup: {++inserted++}, {--deleted--}, {~~old~>new~~}, {==commented==}{>>Author (date): comment<<}, each change followed by its author and date. \"accept\" gives the text with every change accepted and \"reject\" the text with every change rejected, both without comments. A document with no tracked changes or comments reads the same either way.",
         schema_with = "option_revisions_schema"
     )]
+    #[serde(default)]
     pub revisions: Option<String>,
 }
 
@@ -651,15 +711,25 @@ pub struct SearchArgs {
         description = "auto (default): exact phrase, falling back to ranked passages when nothing matches. literal: exact phrase only. ranked: BM25 over the query words."
     )]
     pub mode: Option<String>,
-    #[schemars(description = "Only search files matching this glob inside directories, e.g. \"*.pdf\" or \"reports/**\".")]
+    #[schemars(
+        description = "Only search files matching this glob inside directories, e.g. \"*.pdf\" or \"reports/**\"."
+    )]
     pub glob: Option<String>,
     #[schemars(schema_with = "option_bool_schema")]
+    #[serde(default)]
     pub case_sensitive: Option<bool>,
     #[schemars(schema_with = "option_bool_schema")]
+    #[serde(default)]
     pub whole_word: Option<bool>,
-    #[schemars(range(min = 1, max = 500), description = "Maximum hits to return (default 20).")]
+    #[schemars(
+        range(min = 1, max = 500),
+        description = "Maximum hits to return (default 20)."
+    )]
     pub max_results: Option<u32>,
-    #[schemars(range(min = 0, max = 1000), description = "Snippet context characters on each side (default 80).")]
+    #[schemars(
+        range(min = 0, max = 1000),
+        description = "Snippet context characters on each side (default 80)."
+    )]
     pub context_chars: Option<u32>,
 }
 
@@ -679,6 +749,12 @@ impl SearchArgs {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InspectOperation {
+    /// Bounded local video timeline.
+    VideoTimeline,
+    /// Decode actual video frames at requested playback timestamps.
+    RenderFrame,
+    /// Deterministic quote and location support, not semantic truth.
+    CiteCheck,
     /// Page count, metadata, and per-page facts.
     Inspect,
     /// Render pages to PNG images.
@@ -695,11 +771,71 @@ pub enum InspectOperation {
     Compare,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiteNormalization {
+    #[default]
+    None,
+    WhitespaceV1,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CiteBoundingBox {
+    pub left: f64,
+    pub bottom: f64,
+    pub right: f64,
+    pub top: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Citation {
+    pub id: Option<String>,
+    #[schemars(
+        length(min = 1, max = 4096),
+        description = "Nonempty quote, at most 4096 UTF-16 units; request total at most 64000 units."
+    )]
+    pub quote: String,
+    #[schemars(
+        range(min = 1),
+        description = "One-based physical PDF page, not a printed page label. At most 20 distinct pages per request."
+    )]
+    pub page: u32,
+    /// Bottom-left PDF coordinates, finite and with positive area. No padding.
+    pub bounding_box: CiteBoundingBox,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct InspectArgs {
+    #[schemars(
+        length(min = 1, max = 100),
+        description = "cite_check only: 1–100 quotes with required page and bounding_box; exactly one PDF source."
+    )]
+    pub citations: Option<Vec<Citation>>,
+    pub normalization: Option<CiteNormalization>,
     pub operation: InspectOperation,
+    #[schemars(
+        description = "video_timeline only (required there): half-open playback window with required end_ms, at most ten minutes and twenty detected-cut scenes. caption only samples one frame per scene through a user-configured local-command adapter."
+    )]
+    pub timeline: Option<crate::video_request::TimelineSelection>,
+    #[schemars(
+        description = "render_frame only: playback timestamps in integer milliseconds (at most twenty). Returns decoded frame metadata with the actual decoded timestamp."
+    )]
+    pub timestamps_ms: Option<Vec<u64>>,
+    #[schemars(
+        length(min = 64, max = 64),
+        description = "cite_check and video operations: fail if the admitted source's SHA-256 differs from this hexadecimal value."
+    )]
+    pub expected_source_sha256: Option<String>,
+    #[schemars(
+        description = "video_timeline only: also attach timed ASR cues from preinstalled local Qwen3-ASR weights. Never downloads models. Default false."
+    )]
+    pub transcript: Option<bool>,
     pub sources: Vec<PdfEvidenceSource>,
-    #[schemars(description = "structure only: fast (default), quality, or research (adds safety, trust, accessibility).")]
+    #[schemars(
+        description = "structure only: fast (default), quality, or research (adds safety, trust, accessibility)."
+    )]
     pub profile: Option<String>,
     #[schemars(range(min = 1, max = 20))]
     pub sample_pages: Option<u32>,
@@ -718,4 +854,27 @@ pub struct InspectArgs {
     #[schemars(range(min = 1_000, max = 1_000_000))]
     pub max_output_chars: Option<u32>,
     pub languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Local OCR engine for ocr_pages: auto, vlm, or tesseract. Omit to use the configured command provider."
+    )]
+    pub ocr: Option<crate::ocr_vlm::OcrEngine>,
+}
+
+/// Navigate a document without a model or vector index.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OutlineArgs {
+    #[schemars(
+        description = "Local video only: outline this bounded playback window from metadata (cuts, chapters, subtitles). No ASR, OCR or captions run."
+    )]
+    pub timeline: Option<crate::video_request::TimelineSelection>,
+    /// File path or http(s) URL.
+    pub source: String,
+    /// json (default) or tree.
+    pub format: Option<String>,
+    /// OCR image-only pages; false by default. Accepts booleans or auto/vlm/tesseract.
+    pub ocr: Option<crate::ocr_vlm::OcrSelection>,
+    /// Embedded images: none (default) or refs. Match this option in node reads.
+    pub images: Option<String>,
+    /// Word revisions: markup (default), accept or reject. Match node reads.
+    pub revisions: Option<String>,
 }

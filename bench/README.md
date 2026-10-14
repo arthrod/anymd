@@ -14,12 +14,17 @@ The benchmark lives in the anymd repository, and anymd is one of the tools it me
 not know which tool produced an output, and the places where anymd loses are in the leaderboard like
 everything else.
 
+Navigation and retrieval QA are a separate track in [`navigation/`](navigation/README.md):
+a frozen public contract fixture, keyless anymd smoke, offline PageIndex Responses adapter,
+and answer/source-page scoring. Its smoke results do not enter the extraction leaderboard.
+
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `corpus.json` | The documents: id, category, format, pinned URL, SHA-256, license, attribution |
-| `files/` | Small license-clean documents committed as-is (the rest are downloaded) |
+| `corpus.json` | The documents: id, category, format, original URL, release mirror URL, SHA-256, license, attribution |
+| `CORPUS-NOTICE` | Redistribution terms and source attribution for every release document |
+| `files/` | Small license-clean documents committed as-is (the rest come from the corpus release) |
 | `truth/<id>.json` | Ground truth for each document (schema below) |
 | `reference/<id>.txt` | Reference text for text F1 (see `reference.py`) |
 | `adapters/<tool>.py` | One adapter per tool |
@@ -38,9 +43,34 @@ MIT-licensed test files, or published under an open government license (Japan PD
 entry in `corpus.json` records the license and where it is stated. arXiv papers are included only when their
 arXiv license is CC BY; papers under arXiv's default non-exclusive license are not.
 
-Documents are downloaded from pinned URLs (versioned arXiv PDFs, dated government releases, Wayback Machine
-`id_` snapshots for pages that change) and verified by SHA-256. Files of 200 KB or less whose license allows it
-are committed in `files/`, so the benchmark survives link rot for those.
+The public [agentdocbench-corpus-v1 release](https://github.com/SylphxAI/anymd/releases/tag/agentdocbench-corpus-v1)
+mirrors all 38 existing documents byte-for-byte. It is a separate corpus release, not an anymd software
+release. Each entry keeps its original `url` (versioned arXiv PDF, dated government release or Wayback
+Machine `id_` snapshot) and adds a fixed `mirror_url` for its release asset. The original SHA-256 remains
+the authority: neither a changed upstream file nor a changed release asset is accepted.
+
+`fetch.py` reuses a verified local file, then a committed file in `files/`, otherwise downloads the release
+asset. It checks the SHA-256 before replacing the destination and fails on corrupt or unavailable assets;
+it does not fall back to upstream or disable TLS certificate checks. Files of 200 KB or less already
+committed in `files/` stay there. No document IDs, bytes, truth, reference text, results or scoring changed.
+
+The release includes `corpus.json`, `CORPUS-NOTICE` and `SHA256SUMS` alongside the individual documents.
+[CORPUS-NOTICE](CORPUS-NOTICE) retains attribution, source links, license links and the MIT notice. CC BY
+and CC BY-SA files remain under those licenses; government files retain their open-government terms.
+Project Gutenberg EPUBs retain their embedded notices and are public domain in the USA; redistribution
+elsewhere depends on local copyright rules.
+
+### Releasing the same corpus
+
+Release v1 was recovered from the existing verified corpus cache and checked against every checksum and
+byte count in `corpus.json` from source commit `50513326503f2aa98a0b9b6c931bf3bb576d86a6`. Recovery from a
+successful Benchmark run's `corpus` artifact is also possible: download it once and verify every file
+against the manifest before publishing. Never regenerate or substitute a document to repair a download.
+
+For a future mirror release, inspect the existing tag's assets first. Publish only files whose manifest
+license evidence permits redistribution, together with the manifest, notices and checksums; use a new
+corpus tag and `--latest=false` so it does not replace the latest software release. Do not overwrite v1
+assets. Any change to corpus bytes is a benchmark change, not mirror maintenance.
 
 Categories: math-heavy papers, two-column papers, designed reports, financial and statistical tables,
 fillable forms, scanned (image-only) PDFs, CJK documents, slides (PDF and PPTX), spreadsheets (XLSX and CSV),
@@ -123,6 +153,48 @@ and on demand (`gh workflow run benchmark.yml -f tools=anymd,docling`). Each too
 GitHub-hosted runner (docling and marker in 4 shards, unstructured in 2) with tesseract (English, Chinese,
 Japanese), poppler, and pandoc installed for every tool alike. The Leaderboard job's summary shows the table,
 and its `agentdocbench-results` artifact holds the merged results JSON and every Markdown output.
+
+## Run validity
+
+Each shard freezes its planned and expected document IDs before conversion. Supported
+conversion errors and missing input files are written to the results JSON, then the
+runner exits nonzero. A conversion exceeding the 900-second default timeout is recorded
+as `timeout` with a zero corpus score, but does not fail the runner or merge: slow tools
+still produce a leaderboard for the complete corpus. Adapter-declared unsupported
+formats remain explicit capability exclusions, not execution failures (their corpus
+score stays zero).
+
+The merge checks every planned shard and document exactly once. Missing, duplicate,
+unexpected or mixed-plan results invalidate the run; failed rows remain diagnostic
+artifacts, not a successful leaderboard. The workflow checks producer status through
+its reporting pipeline and renders only the current selected tools, never stale
+committed results for a missing producer.
+
+OmniDocBench applies the same contract to page predictions and timing records. ASR
+freezes utterance IDs: a missing output file or row is a failure, while a present,
+valid empty transcript is an accuracy observation. Incomplete ASR batches have no
+valid full-audio RTF and are excluded from accuracy, speed and timestamp tables.
+The ASR workflow passes its selected plan matrix to the report: each selected job
+must produce exactly one matching outcome, including jobs that failed during setup.
+Unselected engines need no outcome. The report exits nonzero for missing, duplicate,
+unexpected, failed or invalid jobs. Without a plan, complete historical outputs
+remain readable, but are not evidence of selected-job coverage.
+
+Docling and Marker must export exactly one Markdown file even when their CLI exits
+zero. A missing export is a conversion error; a present empty file remains a valid
+accuracy-zero observation. Sherpa disables its argument banner and recognizes only
+exact requested audio paths, not log lines that happen to end in `.wav`.
+
+Offline checks need no model, dataset or Rust build:
+
+```bash
+python3 -m unittest discover -s bench -p test_validity.py
+```
+
+The existing hosted ASR scorer test entrypoint also loads these checks. Outcome
+handling follows [checked subprocess exits](https://docs.python.org/3/library/subprocess.html)
+and the separate failure/error/skipped outcomes in
+[JUnit XML conventions](https://github.com/testmoapp/junitxml).
 
 ## Submitting a tool
 

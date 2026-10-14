@@ -208,12 +208,31 @@ struct SourceRead {
     error: Option<String>,
 }
 
+/// Marker for a page with no text layer that images cover (a scan nobody read).
+pub(crate) fn scan_marker(page: u32, ocr_ran: bool) -> String {
+    if ocr_ran {
+        return format!("<!-- page {page}: scanned image; OCR found no text -->\n\n");
+    }
+    format!(
+        "<!-- page {page}: scanned image, no text layer; to enable local OCR, run `anymd setup ocr` (opts into downloading the OCR engine and ~2 GB of model weights), then retry with OCR enabled (`ocr: true` in MCP or `--ocr auto` in the CLI); documents stay on this machine -->\n\n"
+    )
+}
+
+const SCAN_ALL_HINT: &str = "<!-- Every page shown is a scanned image with no text layer, so nothing was read; to enable local OCR, run `anymd setup ocr` (opts into downloading the OCR engine and ~2 GB of model weights), then retry with OCR enabled (`ocr: true` in MCP or `--ocr auto` in the CLI); documents stay on this machine -->";
+
+const SCAN_ALL_OCR_HINT: &str =
+    "<!-- Every page shown is a scanned image; OCR ran and found no text -->";
+
 fn front_matter(header: &[(String, String)]) -> String {
     let mut out = String::from("---\n");
     for (key, value) in header {
         out.push_str(key);
         out.push_str(": ");
-        out.push_str(&yaml_value(value));
+        if key == "scanned_pages" {
+            out.push_str(value);
+        } else {
+            out.push_str(&yaml_value(value));
+        }
         out.push('\n');
     }
     out.push_str("---\n\n");
@@ -247,7 +266,23 @@ fn read_opened(
     cursor: Option<Cursor>,
     budget: usize,
     first_call: bool,
+    node_id: Option<&str>,
 ) -> SourceRead {
+    let navigation = match node_id {
+        Some(id) => match crate::outline::Outline::build(opened) {
+            Ok(outline) => match outline.nodes.iter().position(|n| n.id == id) {
+                Some(index) => Some((outline, index)),
+                None => {
+                    return failed(
+                        &opened.label,
+                        format!("Unknown node {id}; call outline for this source."),
+                    )
+                }
+            },
+            Err(message) => return failed(&opened.label, message),
+        },
+        None => None,
+    };
     let total = opened.total;
     let mut wanted: Vec<u32> = match selection {
         Some(pages) => pages
@@ -256,6 +291,10 @@ fn read_opened(
             .collect(),
         None => (1..=total).collect(),
     };
+    if let Some((outline, index)) = &navigation {
+        let node = &outline.nodes[*index];
+        wanted.retain(|page| *page >= node.from && *page <= node.to);
+    }
     if let Some(cursor) = cursor {
         wanted.retain(|page| *page >= cursor.page);
     }
@@ -282,6 +321,7 @@ fn read_opened(
     let mut next = None;
     let mut used = 0usize;
     let mut visible = 0usize;
+    let mut scanned: Vec<u32> = Vec::new();
     let chunk_size = if opened.is_paged() {
         PAGE_CHUNK
     } else {
@@ -293,25 +333,64 @@ fn read_opened(
             Err(message) => return failed(&opened.label, message),
         };
         opened.title_from_units(&units);
+        let chunk_scans = opened.scanned_pages(&units);
         for unit in units {
+            let (clip_start, clip_end) = if let Some((outline, index)) = &navigation {
+                let node = &outline.nodes[*index];
+                let Some(range) = outline.units.iter().find(|r| r.number == unit.number) else {
+                    continue;
+                };
+                let start = node.start.max(range.start);
+                let end = node.end.min(range.end);
+                if start >= end {
+                    continue;
+                }
+                (
+                    range.offset + start - range.start,
+                    range.offset + end - range.start,
+                )
+            } else {
+                (0, unit.markdown.len())
+            };
             let mut skip = match cursor {
                 Some(cursor) if cursor.page == unit.number => {
                     cursor.offset.min(unit.markdown.len())
                 }
                 _ => 0,
             };
+            skip = skip.max(clip_start).min(clip_end);
             while !unit.markdown.is_char_boundary(skip) {
                 skip -= 1;
             }
-            let content = unit.markdown[skip..].trim_start();
-            visible += content.chars().filter(|c| c.is_alphanumeric()).count();
-            let marker = match (markers, skip > 0) {
+            let content = unit.markdown[skip..clip_end].trim_start();
+            let visible_text = if navigation.is_some() {
+                unit.markdown.as_str()
+            } else {
+                content
+            };
+            visible += visible_text.chars().filter(|c| c.is_alphanumeric()).count();
+            let continued = if navigation.is_some() {
+                cursor.is_some_and(|cursor| cursor.page == unit.number && cursor.offset > 0)
+            } else {
+                skip > 0
+            };
+            let mut marker = match (markers, continued) {
                 (false, false) => String::new(),
                 (false, true) => "<!-- continued -->\n\n".to_string(),
                 (true, false) => format!("<!-- {} -->\n\n", unit.label),
                 (true, true) => format!("<!-- {} (continued) -->\n\n", unit.label),
             };
-            let piece_tokens = estimate_tokens(content) + 8;
+            let is_scan = chunk_scans.contains(&unit.number) && !continued;
+            if is_scan {
+                marker.push_str(&scan_marker(unit.number, opened.ocr_ran(unit.number)));
+            }
+            // A scan page is charged its page label and scan marker, plus its
+            // entry in the `scanned_pages` header; text pages keep the old cost.
+            let piece_tokens = if is_scan {
+                estimate_tokens(content) + estimate_tokens(&marker) + 4
+            } else {
+                estimate_tokens(content) + 8
+            };
             if used + piece_tokens > budget {
                 if shown.is_empty() {
                     // A unit larger than the whole budget: cut inside it.
@@ -322,7 +401,10 @@ fn read_opened(
                     body.push_str(content[..cut].trim_end());
                     body.push_str("\n\n");
                     shown.push(unit.number);
-                    let consumed = unit.markdown.len() - content.len() + cut;
+                    if is_scan {
+                        scanned.push(unit.number);
+                    }
+                    let consumed = clip_end - content.len() + cut;
                     if cut < content.len() {
                         next = Some(Cursor {
                             page: unit.number,
@@ -346,6 +428,9 @@ fn read_opened(
             body.push_str(content.trim_end());
             body.push_str("\n\n");
             shown.push(unit.number);
+            if is_scan {
+                scanned.push(unit.number);
+            }
             used += piece_tokens;
         }
     }
@@ -371,13 +456,38 @@ fn read_opened(
             ));
         }
     }
-    if opened.format == "pdf" && !shown.is_empty() && visible < shown.len() * 20 {
+    if !scanned.is_empty() {
+        header.push((
+            "scanned_pages".into(),
+            format!(
+                "[{}]",
+                scanned
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+        if scanned.len() == shown.len() {
+            let hint = if scanned.iter().all(|page| opened.ocr_ran(*page)) {
+                SCAN_ALL_OCR_HINT
+            } else {
+                SCAN_ALL_HINT
+            };
+            body = format!("{hint}\n\n{body}");
+        }
+    }
+    if opened.format == "pdf"
+        && scanned.is_empty()
+        && !shown.is_empty()
+        && visible < shown.len() * 20
+    {
         body.push_str(
             "<!-- These pages have little or no selectable text (scanned or image-only). \
 Install `tesseract` for automatic OCR, or pass ocr: true. -->\n\n",
         );
     }
-    if next.is_some() && first_call {
+    if next.is_some() && first_call && navigation.is_none() && opened.format == "pdf" {
         let entries: Vec<String> = opened
             .outline()
             .iter()
@@ -436,7 +546,10 @@ pub fn read(
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let (text, failed) = read_text(args, policy, &ReadRender::default())
         .map_err(|message| rmcp::ErrorData::invalid_params(message, None))?;
-    Ok(finish(text, failed))
+    // Missing VLM setup is guidance, not a failure: a normal result, like the
+    // Pro notice, so the agent relays it.
+    let setup_needed = failed && text.trim_end() == crate::ocr_vlm::SETUP_NOTICE;
+    Ok(finish(text, failed && !setup_needed))
 }
 
 /// How a read is rendered: the MCP tool uses the defaults; the CLI prints
@@ -467,7 +580,34 @@ pub fn read_text(
         (None, true) => usize::MAX,
         (value, _) => budget_from(value),
     };
-    let cursor = args.cursor.as_deref().map(Cursor::parse).transpose()?;
+    let video = if let Some(selection) = &args.timeline {
+        if args.download_asr_model.unwrap_or(false) {
+            return Err("timeline never downloads models".into());
+        }
+        let ocr = args.ocr.filter(|s| s.enabled()).map(|s| s.engine());
+        Some(crate::video_request::document(
+            &args.source,
+            selection,
+            args.transcript.unwrap_or(false),
+            ocr,
+            policy,
+        )?)
+    } else {
+        None
+    };
+    let manifest = video.as_ref().map(crate::video_request::manifest_id);
+    let cursor_text = match (&manifest, args.cursor.as_deref()) {
+        (Some(identity), Some(cursor)) => Some(
+            cursor
+                .strip_prefix(&format!("video:{identity}:"))
+                .ok_or("video cursor source/manifest/options mismatch")?,
+        ),
+        (None, Some(cursor)) if cursor.starts_with("video:") => {
+            return Err("video cursor requires matching timeline options".into())
+        }
+        (_, cursor) => cursor,
+    };
+    let cursor = cursor_text.map(Cursor::parse).transpose()?;
     let selection = match args
         .pages
         .as_deref()
@@ -481,24 +621,61 @@ pub fn read_text(
     if !is_url(source) {
         let admitted = policy.admit_path(source)?;
         if Path::new(&admitted).is_dir() {
+            if args.node.is_some() {
+                return Err("node requires a document, not a directory".into());
+            }
             return Ok((list_directory(source, Path::new(&admitted)), false));
         }
     }
+    let inherits_env = matches!(
+        args.ocr,
+        None | Some(crate::ocr_vlm::OcrSelection::Enabled(true))
+    );
+    let environment = if inherits_env {
+        match std::env::var("ANYMD_OCR") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err("Invalid ANYMD_OCR".into()),
+        }
+    } else {
+        None
+    };
+    let ocr_engine = crate::ocr_vlm::resolve_engine(args.ocr, environment.as_deref())?;
     let options = OpenOptions {
-        ocr: args.ocr,
-        transcript: args.transcript.unwrap_or(false)
-            || args.download_whisper_model.unwrap_or(false),
-        download_whisper_model: args.download_whisper_model.unwrap_or(false),
-        images: args
-            .wants_images()
+        ocr: args
+            .ocr
+            .map(|v| v.enabled())
+            .or_else(|| args.node.as_ref().map(|_| false)),
+        ocr_engine: Some(ocr_engine),
+        transcript: args.transcript.unwrap_or(false) || args.download_asr_model.unwrap_or(false),
+        download_asr_model: args.download_asr_model.unwrap_or(false),
+        images: (args.wants_images() && (args.node.is_none() || args.images.is_some()))
             .then(anymd_formats::images::ImageStore::default_location)
             .flatten(),
         revisions: args.revisions(),
     };
-    let read = match Opened::open(source, policy, &options) {
-        Ok(mut opened) => read_opened(&mut opened, selection, cursor, budget, cursor.is_none()),
+    let opened = match video {
+        Some(evidence) => Ok(Opened::from_video(source, &evidence)),
+        None => Opened::open(source, policy, &options),
+    };
+    let read = match opened {
+        Ok(mut opened) => read_opened(
+            &mut opened,
+            selection,
+            cursor,
+            budget,
+            cursor.is_none(),
+            args.node.as_deref(),
+        ),
         Err(message) => failed(source, message),
     };
+    if read
+        .error
+        .as_deref()
+        .is_some_and(crate::ocr_vlm::is_setup_notice)
+    {
+        return Ok((format!("{}\n", crate::ocr_vlm::SETUP_NOTICE), true));
+    }
     let mut out = if render.front_matter || read.error.is_some() {
         front_matter(&read.header)
     } else {
@@ -506,7 +683,14 @@ pub fn read_text(
     };
     out.push_str(&read.body);
     if let Some(next) = read.next {
-        out.push_str(&continuation_note(budget, next));
+        let note = continuation_note(budget, next);
+        out.push_str(&match manifest {
+            Some(identity) => note.replace(
+                &format!("\"{}\"", next.render()),
+                &format!("\"video:{identity}:{}\"", next.render()),
+            ),
+            None => note,
+        });
     }
     Ok((out.trim_end().to_string() + "\n", read.error.is_some()))
 }
@@ -627,7 +811,14 @@ fn pdf_source_read(
         Err(message) => return failed(&label, message),
     };
     match Opened::open(&label, policy, &OpenOptions::default()) {
-        Ok(mut opened) => read_opened(&mut opened, selection, cursor, budget, cursor.is_none()),
+        Ok(mut opened) => read_opened(
+            &mut opened,
+            selection,
+            cursor,
+            budget,
+            cursor.is_none(),
+            None,
+        ),
         Err(message) => failed(&label, message),
     }
 }
@@ -727,6 +918,7 @@ struct SearchDoc {
     noun: &'static str,
     total: u32,
     units: std::sync::Arc<Vec<Unit>>,
+    outline: crate::outline::Outline,
 }
 
 fn locator(doc: &SearchDoc, unit: &Unit) -> String {
@@ -805,8 +997,9 @@ fn load_search_docs(
         .min(files.len().max(1));
     let options = OpenOptions {
         ocr: Some(false),
+        ocr_engine: None,
         transcript: false,
-        download_whisper_model: false,
+        download_asr_model: false,
         images: None,
         revisions: anymd_formats::Revisions::default(),
     };
@@ -825,11 +1018,14 @@ fn load_search_docs(
                         .step_by(workers)
                         .map(|(index, (label, spec))| {
                             let doc = Opened::open(spec, policy, options).and_then(|opened| {
+                                let units = opened.all_units()?;
+                                let outline = crate::outline::Outline::from_units(&opened, &units);
                                 Ok(SearchDoc {
                                     label: label.clone(),
                                     noun: opened.unit_noun,
                                     total: opened.total,
-                                    units: opened.all_units()?,
+                                    units,
+                                    outline,
                                 })
                             });
                             (index, doc)
@@ -886,6 +1082,17 @@ struct Hit<'a> {
     doc: &'a SearchDoc,
     unit: &'a Unit,
     snippet: String,
+    offset: usize,
+}
+
+fn hit_locator(hit: &Hit<'_>) -> String {
+    let node = hit.doc.outline.node_at(hit.unit.number, hit.offset);
+    format!(
+        "{} [node {}; {}]",
+        locator(hit.doc, hit.unit),
+        node.id,
+        node.path
+    )
 }
 
 fn literal_hits<'a>(
@@ -928,6 +1135,7 @@ fn literal_hits<'a>(
                         doc,
                         unit,
                         snippet: snippet(&unit.markdown, s, e, context, &[(s, e)]),
+                        offset: s,
                     });
                 }
             }
@@ -998,26 +1206,33 @@ fn ranked_hits<'a>(
         .map(|(score, index)| {
             let (doc, unit, _, _) = &units[index];
             // Highlight query terms; center on the rarest one present.
-            let lower = unit.markdown.to_lowercase();
-            let same_len = lower.len() == unit.markdown.len();
+            let (lower, offsets) = fold(&unit.markdown, false);
             let mut highlights = Vec::new();
             let mut anchor: Option<(f64, usize, usize)> = None;
-            if same_len {
-                for term in &query_terms {
-                    let mut from = 0;
-                    while let Some(found) = lower[from..].find(term.as_str()) {
-                        let start = from + found;
-                        let end = start + term.len();
-                        from = end;
-                        let bounded = is_cjk(term.chars().next().unwrap_or(' '))
-                            || (!is_word_char(lower[..start].chars().next_back())
-                                && !is_word_char(lower[end..].chars().next()));
-                        if bounded {
-                            highlights.push((start, end));
-                            let weight = idf[term];
-                            if anchor.is_none_or(|(w, _, _)| weight > w) {
-                                anchor = Some((weight, start, end));
-                            }
+            for term in &query_terms {
+                let mut from = 0;
+                while let Some(found) = lower[from..].find(term.as_str()) {
+                    let start = from + found;
+                    let end = start + term.len();
+                    from = end;
+                    let bounded = is_cjk(term.chars().next().unwrap_or(' '))
+                        || (!is_word_char(lower[..start].chars().next_back())
+                            && !is_word_char(lower[end..].chars().next()));
+                    if bounded {
+                        let start = offsets[start];
+                        let mut end = offsets[end];
+                        if end <= start {
+                            end = start
+                                + unit.markdown[start..]
+                                    .chars()
+                                    .next()
+                                    .map(char::len_utf8)
+                                    .unwrap_or(0);
+                        }
+                        highlights.push((start, end));
+                        let weight = idf[term];
+                        if anchor.is_none_or(|(w, _, _)| weight > w) {
+                            anchor = Some((weight, start, end));
                         }
                     }
                 }
@@ -1029,6 +1244,7 @@ fn ranked_hits<'a>(
                     doc,
                     unit,
                     snippet: snippet(&unit.markdown, start, end, context, &highlights),
+                    offset: start,
                 },
             )
         })
@@ -1096,7 +1312,7 @@ fn run_search(
                     out.push_str(&format!("\n### {} ({count})\n", doc.label));
                 }
                 for hit in hits.iter().take(options.max_results - shown) {
-                    let loc = locator(hit.doc, hit.unit);
+                    let loc = hit_locator(hit);
                     let loc = loc.trim_start();
                     if loc.is_empty() {
                         out.push_str(&format!("- {}\n", hit.snippet));
@@ -1129,7 +1345,7 @@ fn run_search(
                 } else {
                     format!("{} ", hit.doc.label)
                 };
-                let loc = locator(hit.doc, hit.unit);
+                let loc = hit_locator(hit);
                 out.push_str(&format!(
                     "{}. {}{} (score {:.1}): {}\n",
                     rank + 1,
@@ -1213,6 +1429,156 @@ pub fn search_pdf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_fixture(name: &str, pages: Option<Vec<u32>>) -> SourceRead {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures")
+            .join(name)
+            .display()
+            .to_string();
+        let options = crate::document::OpenOptions {
+            ocr: Some(false),
+            ..Default::default()
+        };
+        let mut opened = Opened::open(
+            &path,
+            &crate::source_access::SourceAccessPolicy::unrestricted(),
+            &options,
+        )
+        .unwrap();
+        read_opened(&mut opened, pages, None, usize::MAX, true, None)
+    }
+
+    #[test]
+    fn a_scanned_page_gets_a_marker_and_a_header_field() {
+        let read = read_fixture("scanned-page.pdf", None);
+        assert!(
+            read.body.contains(
+                "<!-- page 1 -->\n\n<!-- page 1: scanned image, no text layer; to enable local OCR, run `anymd setup ocr` (opts into downloading the OCR engine and ~2 GB of model weights), then retry with OCR enabled (`ocr: true` in MCP or `--ocr auto` in the CLI); documents stay on this machine -->"
+            ),
+            "{}",
+            read.body
+        );
+        assert!(!read.body.contains("page 2: scanned"), "{}", read.body);
+        assert!(read.body.contains("real text layer"));
+        let field = read.header.iter().find(|(k, _)| k == "scanned_pages");
+        assert_eq!(field.map(|(_, v)| v.as_str()), Some("[1]"));
+        // One page of two is text, so there is no all-scans hint.
+        assert!(!read.body.starts_with("<!-- Every page"), "{}", read.body);
+        assert!(front_matter(&read.header).contains("scanned_pages: [1]\n"));
+    }
+
+    #[test]
+    fn a_scanned_page_where_ocr_ran_says_it_found_no_text() {
+        let mut opened = Opened::open(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test/fixtures/scanned-page.pdf")
+                .display()
+                .to_string(),
+            &crate::source_access::SourceAccessPolicy::unrestricted(),
+            &crate::document::OpenOptions {
+                ocr: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        opened.note_ocr_ran(1);
+        let read = read_opened(&mut opened, Some(vec![1]), None, usize::MAX, true, None);
+        assert!(
+            read.body
+                .contains("<!-- page 1: scanned image; OCR found no text -->"),
+            "{}",
+            read.body
+        );
+        assert!(!read.body.contains("enable OCR"), "{}", read.body);
+    }
+
+    #[test]
+    fn all_scanned_pages_lead_with_a_hint() {
+        let read = read_fixture("scanned-page.pdf", Some(vec![1]));
+        assert!(
+            read.body
+                .starts_with("<!-- Every page shown is a scanned image"),
+            "{}",
+            read.body
+        );
+    }
+
+    /// A PDF of `pages` full-page image-only pages sharing one tiny image.
+    fn scan_pdf(pages: u32) -> Vec<u8> {
+        let mut objects: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+                (0..pages)
+                    .map(|i| format!("{} 0 R", 6 + i))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nA\nendstream".into(),
+            "<< /Length 30 >>\nstream\nq 612 0 0 792 0 0 cm /Im1 Do Q\nendstream".into(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        ];
+        for _ in 0..pages {
+            objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 3 0 R >> >> /Contents 4 0 R >>".into());
+        }
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        out.into_bytes()
+    }
+
+    #[test]
+    fn a_long_scan_stays_within_the_token_budget_and_returns_a_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan.pdf");
+        std::fs::write(&path, scan_pdf(500)).unwrap();
+        let options = crate::document::OpenOptions {
+            ocr: Some(false),
+            ..Default::default()
+        };
+        let mut opened = Opened::open(
+            &path.display().to_string(),
+            &crate::source_access::SourceAccessPolicy::unrestricted(),
+            &options,
+        )
+        .unwrap();
+        let read = read_opened(&mut opened, None, None, 20_000, true, None);
+        assert!(read.next.is_some(), "expected a cursor");
+        let header = front_matter(&read.header);
+        let total = estimate_tokens(&header) + estimate_tokens(&read.body);
+        assert!(total <= 20_000, "{total} tokens");
+        assert!(read.header.iter().any(|(k, _)| k == "scanned_pages"));
+        assert!(!read.body.contains("Install `tesseract`"), "{}", read.body);
+    }
+
+    #[test]
+    fn text_pdfs_get_no_scan_marker_or_field() {
+        for name in ["sample.pdf", "figure-report.pdf"] {
+            let read = read_fixture(name, None);
+            assert!(
+                !read.body.contains("scanned image"),
+                "{name}: {}",
+                read.body
+            );
+            assert!(read.header.iter().all(|(k, _)| k != "scanned_pages"));
+        }
+    }
 
     #[test]
     fn cursor_round_trips() {
@@ -1304,13 +1670,15 @@ mod tests {
     fn read_converts_a_csv_to_a_table() {
         let dir = fixture_dir();
         let args = ReadArgs {
+            timeline: None,
             source: dir.path().join("prices.csv").display().to_string(),
             pages: None,
+            node: None,
             max_tokens: None,
             cursor: None,
             ocr: None,
             transcript: None,
-            download_whisper_model: None,
+            download_asr_model: None,
             images: None,
             revisions: None,
         };
@@ -1323,13 +1691,15 @@ mod tests {
     fn read_lists_a_directory() {
         let dir = fixture_dir();
         let args = ReadArgs {
+            timeline: None,
             source: dir.path().display().to_string(),
             pages: None,
+            node: None,
             max_tokens: None,
             cursor: None,
             ocr: None,
             transcript: None,
-            download_whisper_model: None,
+            download_asr_model: None,
             images: None,
             revisions: None,
         };

@@ -1,3 +1,7 @@
+---
+description: "AgentDocBench: anymd against docling, markitdown, marker, kreuzberg, unstructured and pdftotext on the same documents."
+---
+
 # Benchmarks
 
 **AgentDocBench** is an open, reproducible benchmark for "document → Markdown for agents". It measures what an
@@ -19,7 +23,7 @@ tables below like everything else. The harness, corpus, ground truth, and raw re
 
 | Tool | Overall | Docs converted | Sentences | Text F1 | Reading order | Table cells F1 | Time, all docs | Output tokens |
 |---|---|---|---|---|---|---|---|---|
-| anymd | **96.3** | 38/38 | 97.7 | 97.0 | 98.8 | 92.2 | 22.9 s | 368,861 |
+| anymd | **96.4** | 38/38 | 97.7 | 97.2 | 98.8 | 92.2 | 11.5 s | 368,659 |
 | docling | 93.0 | 38/38 | 94.4 | 94.5 | 94.4 | 89.9 | 2,432.4 s | 430,148 |
 | kreuzberg | 81.7 | 38/38 | 90.1 | 96.4 | 96.8 | 38.4 | 16.0 s | 455,689 |
 | unstructured | 81.2 | 38/38 | 92.0 | 97.1 | 93.9 | 38.4 | 346.5 s | 414,333 |
@@ -40,19 +44,19 @@ Overall is the mean of the category scores below, so every category weighs the s
 | Forms | 3 | **98.0** | 95.6 | 73.1 | 74.6 | 74.8 | 61.0 | 74.2 |
 | Scanned (OCR) | 3 | 77.9 | **78.4** | 62.4 | 60.5 | 0.0 | 53.3 | 0.0 |
 | CJK | 3 | **99.1** | 97.4 | 56.9 | 71.8 | 79.8 | 87.6 | 75.0 |
-| Slides | 4 | **95.7** | 93.8 | 82.0 | 84.9 | 86.5 | 91.0 | 37.5 |
+| Slides | 4 | **96.0** | 93.8 | 82.0 | 84.9 | 86.5 | 91.0 | 37.5 |
 | Spreadsheets | 4 | **100.0** | 85.8 | **100.0** | 85.7 | 99.7 | 38.1 | 0.0 |
-| Word | 3 | 99.8 | **99.9** | 99.8 | 99.8 | 99.8 | 94.7 | 0.0 |
+| Word | 3 | **99.9** | 99.9 | 99.8 | 99.8 | 99.8 | 94.7 | 0.0 |
 | EPUB | 3 | 98.9 | **99.7** | 99.1 | 99.1 | 97.7 | 66.4 | 0.0 |
 | HTML | 3 | 99.6 | 90.5 | **100.0** | 98.1 | 98.1 | 60.6 | 0.0 |
 
-**Where anymd loses:** Reports (docling 97.7 vs 96.9); Scanned (OCR) (docling 78.4 vs 77.9); Word (docling 99.9 vs 99.8); EPUB (docling 99.7 vs 98.9); HTML (kreuzberg 100.0 vs 99.6).
+**Where anymd loses:** Reports (docling 97.7 vs 96.9); Scanned (OCR) (docling 78.4 vs 77.9); EPUB (docling 99.7 vs 98.9); HTML (kreuzberg 100.0 vs 99.6).
 
 ### Speed and tokens on the 19 documents every tool converted
 
 | Tool | Total time | Median per document | Output tokens |
 |---|---|---|---|
-| anymd | 12.1 s | 0.05 s | 146,672 |
+| anymd | 4.58 s | 0.04 s | 146,660 |
 | docling | 1,723.3 s | 63.9 s | 162,290 |
 | kreuzberg | 7.94 s | 0.20 s | 139,422 |
 | unstructured | 187.4 s | 7.74 s | 145,360 |
@@ -64,44 +68,44 @@ Overall is the mean of the category scores below, so every category weighs the s
 
 | Document | Category | anymd | docling | kreuzberg | unstructured | markitdown | marker | pdftotext |
 |---|---|---|---|---|---|---|---|---|
-| `paper-evsched` | paper | 98.4 · 0.12 s | 98.9 · 103.3 s | 74.9 · 0.20 s | 71.0 · 9.04 s | 77.5 · 2.76 s | 77.3 · 46.4 s | 75.0 · 0.06 s |
-| `paper-rankone` | paper | 94.8 · 0.10 s | 90.7 · 353.6 s | 98.0 · 0.41 s | 95.9 · 11.7 s | 75.6 · 3.51 s | timeout | 100.0 · 0.10 s |
-| `paper-ulam` | paper | 96.9 · 0.03 s | 84.8 · 65.0 s | 74.7 · 0.20 s | 74.0 · 10.1 s | 69.4 · 2.06 s | 92.8 · 600.6 s | 75.0 · 0.04 s |
-| `twocol-bygpt5` | two-column | 96.7 · 0.14 s | 93.6 · 74.7 s | 62.2 · 0.39 s | 63.5 · 7.74 s | 47.5 · 4.03 s | 99.0 · 73.2 s | 75.0 · 0.12 s |
-| `twocol-smile` | two-column | 99.1 · 0.12 s | 91.6 · 70.4 s | 74.7 · 0.31 s | 58.2 · 9.88 s | 45.1 · 3.13 s | 95.9 · 112.2 s | 75.0 · 0.06 s |
-| `twocol-uscore` | two-column | 98.6 · 0.12 s | 94.0 · 73.8 s | 74.7 · 0.35 s | 60.6 · 7.28 s | 50.3 · 3.37 s | timeout | 75.0 · 0.10 s |
-| `report-crs-dod-approps` | report | 94.8 · 0.05 s | 96.1 · 42.4 s | 74.5 · 0.26 s | 74.9 · 8.40 s | 95.8 · 2.86 s | 77.5 · 297.3 s | 75.0 · 0.03 s |
-| `report-plz` | report | 99.0 · 0.02 s | 99.3 · 22.9 s | 93.0 · 0.10 s | 99.9 · 5.34 s | 99.1 · 1.63 s | 98.9 · 10.8 s | 100.0 · 0.01 s |
-| `fed-h8` | financial | 98.0 · 0.09 s | 91.0 · 621.1 s | 71.9 · 0.40 s | 75.0 · 14.5 s | 75.0 · 6.79 s | 91.1 · 24.0 s | 75.0 · 0.06 s |
-| `fin-bls-realer` | financial | 88.3 · 0.03 s | 87.7 · 32.0 s | 65.9 · 0.15 s | 68.3 · 5.80 s | 55.6 · 1.69 s | 84.1 · 428.0 s | 75.0 · 0.02 s |
-| `fin-census-income` | financial | 99.6 · 0.07 s | 91.6 · 129.4 s | 69.6 · 0.26 s | 69.2 · 8.56 s | 33.0 · 2.55 s | 92.9 · 621.1 s | 70.8 · 0.04 s |
-| `invoice-borderless` | financial | 94.8 · 0.01 s | 99.5 · 25.8 s | 75.0 · 0.07 s | 75.0 · 5.09 s | 100.0 · 1.04 s | 89.8 · 25.4 s | 75.0 · 0.01 s |
-| `form-1040es` | form | 97.5 · 0.07 s | 94.6 · 101.8 s | 69.8 · 0.22 s | 74.1 · 10.2 s | 74.5 · 5.26 s | timeout | 75.0 · 0.04 s |
-| `form-w4` | form | 97.7 · 0.05 s | 92.5 · 63.9 s | 74.7 · 0.16 s | 75.0 · 6.35 s | 75.0 · 3.34 s | 94.4 · 594.8 s | 72.7 · 0.02 s |
-| `irs-w9` | form | 98.9 · 0.04 s | 99.8 · 37.2 s | 74.8 · 0.15 s | 74.7 · 7.84 s | 74.9 · 2.71 s | 88.6 · 508.7 s | 75.0 · 0.02 s |
-| `scan-nasa-budget` | scanned | 71.6 · 3.57 s | 77.2 · 33.7 s | 37.2 · 2.17 s | 40.0 · 30.6 s | 0.0 · 0.94 s | 93.3 · 561.9 s | 0.0 · 0.01 s |
-| `scan-nasa-notes` | scanned | 62.1 · 2.78 s | 58.1 · 32.6 s | 66.7 · 2.11 s | 58.1 · 25.6 s | 0.0 · 0.95 s | 66.7 · 524.6 s | 0.0 · 0.01 s |
-| `scan-oklahoma-address` | scanned | 100.0 · 10.4 s | 100.0 · 56.5 s | 83.3 · 5.52 s | 83.3 · 64.1 s | 0.0 · 0.97 s | timeout | 0.0 · 0.01 s |
-| `cjk-jp-stat-elderly` | cjk | 99.1 · 0.04 s | 98.0 · 70.8 s | 52.8 · 0.14 s | 66.7 · 7.23 s | 97.2 · 1.73 s | 97.6 · 10.4 s | 75.0 · 0.02 s |
+| `paper-evsched` | paper | 98.4 · 0.07 s | 98.9 · 103.3 s | 74.9 · 0.20 s | 71.0 · 9.04 s | 77.5 · 2.76 s | 77.3 · 46.4 s | 75.0 · 0.06 s |
+| `paper-rankone` | paper | 94.8 · 0.06 s | 90.7 · 353.6 s | 98.0 · 0.41 s | 95.9 · 11.7 s | 75.6 · 3.51 s | timeout | 100.0 · 0.10 s |
+| `paper-ulam` | paper | 96.9 · 0.02 s | 84.8 · 65.0 s | 74.7 · 0.20 s | 74.0 · 10.1 s | 69.4 · 2.06 s | 92.8 · 600.6 s | 75.0 · 0.04 s |
+| `twocol-bygpt5` | two-column | 96.7 · 0.10 s | 93.6 · 74.7 s | 62.2 · 0.39 s | 63.5 · 7.74 s | 47.5 · 4.03 s | 99.0 · 73.2 s | 75.0 · 0.12 s |
+| `twocol-smile` | two-column | 99.1 · 0.08 s | 91.6 · 70.4 s | 74.7 · 0.31 s | 58.2 · 9.88 s | 45.1 · 3.13 s | 95.9 · 112.2 s | 75.0 · 0.06 s |
+| `twocol-uscore` | two-column | 98.6 · 0.08 s | 94.0 · 73.8 s | 74.7 · 0.35 s | 60.6 · 7.28 s | 50.3 · 3.37 s | timeout | 75.0 · 0.10 s |
+| `report-crs-dod-approps` | report | 94.8 · 0.04 s | 96.1 · 42.4 s | 74.5 · 0.26 s | 74.9 · 8.40 s | 95.8 · 2.86 s | 77.5 · 297.3 s | 75.0 · 0.03 s |
+| `report-plz` | report | 99.0 · 0.01 s | 99.3 · 22.9 s | 93.0 · 0.10 s | 99.9 · 5.34 s | 99.1 · 1.63 s | 98.9 · 10.8 s | 100.0 · 0.01 s |
+| `fed-h8` | financial | 98.0 · 0.06 s | 91.0 · 621.1 s | 71.9 · 0.40 s | 75.0 · 14.5 s | 75.0 · 6.79 s | 91.1 · 24.0 s | 75.0 · 0.06 s |
+| `fin-bls-realer` | financial | 88.3 · 0.02 s | 87.7 · 32.0 s | 65.9 · 0.15 s | 68.3 · 5.80 s | 55.6 · 1.69 s | 84.1 · 428.0 s | 75.0 · 0.02 s |
+| `fin-census-income` | financial | 99.6 · 0.05 s | 91.6 · 129.4 s | 69.6 · 0.26 s | 69.2 · 8.56 s | 33.0 · 2.55 s | 92.9 · 621.1 s | 70.8 · 0.04 s |
+| `invoice-borderless` | financial | 94.8 · 0.00 s | 99.5 · 25.8 s | 75.0 · 0.07 s | 75.0 · 5.09 s | 100.0 · 1.04 s | 89.8 · 25.4 s | 75.0 · 0.01 s |
+| `form-1040es` | form | 97.5 · 0.05 s | 94.6 · 101.8 s | 69.8 · 0.22 s | 74.1 · 10.2 s | 74.5 · 5.26 s | timeout | 75.0 · 0.04 s |
+| `form-w4` | form | 97.7 · 0.03 s | 92.5 · 63.9 s | 74.7 · 0.16 s | 75.0 · 6.35 s | 75.0 · 3.34 s | 94.4 · 594.8 s | 72.7 · 0.02 s |
+| `irs-w9` | form | 98.9 · 0.03 s | 99.8 · 37.2 s | 74.8 · 0.15 s | 74.7 · 7.84 s | 74.9 · 2.71 s | 88.6 · 508.7 s | 75.0 · 0.02 s |
+| `scan-nasa-budget` | scanned | 71.6 · 2.22 s | 77.2 · 33.7 s | 37.2 · 2.17 s | 40.0 · 30.6 s | 0.0 · 0.94 s | 93.3 · 561.9 s | 0.0 · 0.01 s |
+| `scan-nasa-notes` | scanned | 62.1 · 1.69 s | 58.1 · 32.6 s | 66.7 · 2.11 s | 58.1 · 25.6 s | 0.0 · 0.95 s | 66.7 · 524.6 s | 0.0 · 0.01 s |
+| `scan-oklahoma-address` | scanned | 100.0 · 6.59 s | 100.0 · 56.5 s | 83.3 · 5.52 s | 83.3 · 64.1 s | 0.0 · 0.97 s | timeout | 0.0 · 0.01 s |
+| `cjk-jp-stat-elderly` | cjk | 99.1 · 0.03 s | 98.0 · 70.8 s | 52.8 · 0.14 s | 66.7 · 7.23 s | 97.2 · 1.73 s | 97.6 · 10.4 s | 75.0 · 0.02 s |
 | `cjk-tw-archives` | cjk | 98.4 · 0.02 s | 98.1 · 27.8 s | 75.0 · 0.22 s | 75.0 · 4.99 s | 75.0 · 1.64 s | 76.9 · 10.4 s | 75.0 · 0.01 s |
-| `cjk-tw-dgbas-cpi` | cjk | 99.9 · 0.05 s | 96.0 · 50.9 s | 42.9 · 0.43 s | 73.7 · 7.73 s | 67.1 · 1.86 s | 88.3 · 11.7 s | 75.0 · 0.03 s |
+| `cjk-tw-dgbas-cpi` | cjk | 99.9 · 0.04 s | 96.0 · 50.9 s | 42.9 · 0.43 s | 73.7 · 7.73 s | 67.1 · 1.86 s | 88.3 · 11.7 s | 75.0 · 0.03 s |
 | `slides-epa-1bp` | slides | 91.7 · 0.01 s | 92.1 · 6.00 s | 86.9 · 0.07 s | 90.0 · 3.47 s | 91.5 · 1.05 s | 92.7 · 86.7 s | unsupported |
-| `slides-markitdown-pptx` | slides | 97.5 · 0.00 s | 99.0 · 8.54 s | 93.9 · 0.06 s | 100.0 · 4.76 s | 97.1 · 0.98 s | 91.0 · 396.8 s | unsupported |
-| `slides-nasa-clarreo` | slides | 94.4 · 4.85 s | 95.2 · 89.6 s | 74.5 · 0.13 s | 74.4 · 5.62 s | 82.4 · 2.12 s | 91.8 · 161.7 s | 75.0 · 0.08 s |
-| `slides-nist-pqc-update` | slides | 99.3 · 0.03 s | 89.0 · 129.8 s | 72.7 · 0.09 s | 75.0 · 6.94 s | 75.0 · 1.55 s | 88.6 · 633.1 s | 75.0 · 0.02 s |
+| `slides-markitdown-pptx` | slides | 98.5 · 0.00 s | 99.0 · 8.54 s | 93.9 · 0.06 s | 100.0 · 4.76 s | 97.1 · 0.98 s | 91.0 · 396.8 s | unsupported |
+| `slides-nasa-clarreo` | slides | 94.5 · 0.04 s | 95.2 · 89.6 s | 74.5 · 0.13 s | 74.4 · 5.62 s | 82.4 · 2.12 s | 91.8 · 161.7 s | 75.0 · 0.08 s |
+| `slides-nist-pqc-update` | slides | 99.3 · 0.04 s | 89.0 · 129.8 s | 72.7 · 0.09 s | 75.0 · 6.94 s | 75.0 · 1.55 s | 88.6 · 633.1 s | 75.0 · 0.02 s |
 | `csv-census-popest-2023` | spreadsheet | 100.0 · 0.00 s | 100.0 · 5.99 s | 100.0 · 0.06 s | 100.0 · 1.05 s | 100.0 · 0.95 s | unsupported | unsupported |
 | `csv-usgs-quakes-week` | spreadsheet | 100.0 · 0.00 s | 100.0 · 8.52 s | 100.0 · 0.07 s | 100.0 · 1.37 s | 100.0 · 0.97 s | unsupported | unsupported |
 | `sheet-ers-crop-insurance` | spreadsheet | 100.0 · 0.00 s | 93.3 · 9.25 s | 100.0 · 0.06 s | 92.7 · 3.70 s | 98.9 · 0.97 s | 52.3 · 9.71 s | unsupported |
 | `sheet-markitdown-xlsx` | spreadsheet | 100.0 · 0.00 s | 50.0 · 9.03 s | 100.0 · 0.06 s | 50.0 · 4.68 s | 100.0 · 0.97 s | 100.0 · 8.74 s | unsupported |
 | `docx-hhs-market-research` | docx | 100.0 · 0.01 s | 100.0 · 6.40 s | 100.0 · 0.06 s | 100.0 · 3.43 s | 100.0 · 1.50 s | 87.9 · 735.9 s | unsupported |
-| `docx-markitdown` | docx | 99.5 · 0.00 s | 100.0 · 8.16 s | 99.5 · 0.06 s | 100.0 · 4.69 s | 99.5 · 1.07 s | 97.4 · 73.8 s | unsupported |
-| `docx-nsf-aaac-minutes` | docx | 99.8 · 0.01 s | 99.7 · 9.68 s | 99.7 · 0.06 s | 99.3 · 3.56 s | 99.8 · 1.25 s | 98.7 · 14.0 s | unsupported |
+| `docx-markitdown` | docx | 100.0 · 0.00 s | 100.0 · 8.16 s | 99.5 · 0.06 s | 100.0 · 4.69 s | 99.5 · 1.07 s | 97.4 · 73.8 s | unsupported |
+| `docx-nsf-aaac-minutes` | docx | 99.8 · 0.00 s | 99.7 · 9.68 s | 99.7 · 0.06 s | 99.3 · 3.56 s | 99.8 · 1.25 s | 98.7 · 14.0 s | unsupported |
 | `epub-gutenberg-jekyll` | epub | 100.0 · 0.01 s | 100.0 · 9.38 s | 100.0 · 0.54 s | 100.0 · 8.84 s | 100.0 · 1.06 s | 99.9 · 246.1 s | unsupported |
 | `epub-gutenberg-relativity` | epub | 100.0 · 0.01 s | 99.9 · 6.89 s | 100.0 · 0.08 s | 100.0 · 6.50 s | 100.0 · 1.23 s | timeout | unsupported |
 | `epub-markitdown` | epub | 96.8 · 0.00 s | 99.3 · 8.08 s | 97.2 · 0.06 s | 97.2 · 4.80 s | 93.2 · 0.96 s | 99.3 · 7.88 s | unsupported |
-| `html-bls-ooh-software-developers` | html | 98.7 · 0.01 s | 93.7 · 9.44 s | 100.0 · 0.07 s | 94.4 · 4.84 s | 94.4 · 1.10 s | 83.2 · 182.9 s | unsupported |
-| `html-markitdown-wikipedia` | html | 100.0 · 0.02 s | 88.9 · 10.6 s | 100.0 · 0.10 s | 100.0 · 6.22 s | 100.0 · 1.37 s | 98.5 · 85.5 s | unsupported |
-| `html-wikipedia-roman-numerals` | html | 100.0 · 0.03 s | 88.9 · 7.47 s | 100.0 · 0.14 s | 100.0 · 3.90 s | 100.0 · 1.66 s | timeout | unsupported |
+| `html-bls-ooh-software-developers` | html | 98.7 · 0.00 s | 93.7 · 9.44 s | 100.0 · 0.07 s | 94.4 · 4.84 s | 94.4 · 1.10 s | 83.2 · 182.9 s | unsupported |
+| `html-markitdown-wikipedia` | html | 100.0 · 0.01 s | 88.9 · 10.6 s | 100.0 · 0.10 s | 100.0 · 6.22 s | 100.0 · 1.37 s | 98.5 · 85.5 s | unsupported |
+| `html-wikipedia-roman-numerals` | html | 100.0 · 0.02 s | 88.9 · 7.47 s | 100.0 · 0.14 s | 100.0 · 3.90 s | 100.0 · 1.66 s | timeout | unsupported |
 
 </details>
 
@@ -109,7 +113,7 @@ Overall is the mean of the category scores below, so every category weighs the s
 
 | Tool | Version | Timed runs | Run |
 |---|---|---|---|
-| [anymd](https://github.com/SylphxAI/anymd) | `anymd 8.1.0` | 3 | [2026-09-26](https://github.com/SylphxAI/anymd/actions/runs/36208170417) |
+| [anymd](https://github.com/SylphxAI/anymd) | `anymd 8.2.0` | 3 | [2026-10-01](https://github.com/SylphxAI/anymd/actions/runs/36794302607) |
 | [docling](https://github.com/docling-project/docling) | `2.130.0` | 1 | [2026-09-25](https://github.com/SylphxAI/anymd/actions/runs/36119654329) |
 | [kreuzberg](https://github.com/kreuzberg-dev/kreuzberg) | `4.10.4` | 3 | [2026-09-25](https://github.com/SylphxAI/anymd/actions/runs/36119654329) |
 | [unstructured](https://github.com/Unstructured-IO/unstructured) | `0.27.8` | 1 | [2026-09-25](https://github.com/SylphxAI/anymd/actions/runs/36119654329) |
@@ -195,6 +199,31 @@ pinned by SHA-256. Generated from `bench/corpus.json`:
 
 <!-- corpus:end -->
 
+## Local doc-VLM resource measurements
+
+[Production worker run 36785961923](https://github.com/SylphxAI/anymd/actions/runs/36785961923), commit `befd305`, measured ten synthetic pages: English, Traditional Chinese and Simplified Chinese clean text, scans and photos, plus a mixed-language page. Each page starts a fresh worker, so timing includes model loading and process overhead. These are not OmniDocBench scores and are not directly comparable to the earlier 50-page spike.
+
+| Target / device | Decoder weights | Median seconds/page | p90 seconds/page | Peak process RSS MiB | Mean CER |
+|---|---|---|---|---|---|
+| Linux x64 / CPU | none | 81.4 | 93.4 | 5320 | 1.90% |
+| Linux x64 / CPU | q8 | 229.7 | 280.1 | 4378 | 1.96% |
+| Linux x64 / CPU | q4 | 207.3 | 254.6 | 4186 | 2.41% |
+| Linux arm64 / CPU | none | 108.2 | 129.5 | 5386 | 1.90% |
+| Linux arm64 / CPU | q8 | 59.8 | 73.4 | 4367 | 1.98% |
+| Linux arm64 / CPU | q4 | 62.4 | 77.3 | 4202 | 1.94% |
+| macOS arm64 / Metal | none | 38.9 | 47.8 | 3763 | 1.88% |
+| macOS arm64 / CPU | q8 | 69.4 | 94.8 | 4477 | 1.94% |
+| macOS arm64 / CPU | q4 | 89.4 | 110.4 | 4458 | 2.41% |
+| Windows x64 / CPU | none | 101.8 | 127.6 | 5358 | 1.90% |
+| Windows x64 / CPU | q8 | 254.2 | 338.0 | 4348 | 1.96% |
+| Windows x64 / CPU | q4 | 230.6 | 285.7 | 4175 | 2.47% |
+
+All twelve configurations converted all ten pages. Quantization applies only to the decoder's linear weights; vision, embeddings and layout stay unquantized. q8/q4 reduce peak RSS on Linux and Windows, but slow x64 CPUs substantially. They remain experimental, CPU-only options, not the default. macOS quantized rows use CPU rather than Metal. RSS was sampled every 100 ms (Windows uses the process peak working set), so it is not a whole-system or GPU-memory measurement.
+
+The default remains unquantized. Automatic OCR never downloads models: without explicit setup it uses tesseract; `anymd setup ocr` opts into installed local models, including slower CPU inference. Native PDF text keeps its existing extraction path. The VLM binary adds 7.5 MiB on Linux x64, 6.1 MiB on Linux arm64, 6.9 MiB on macOS arm64 and 8.2 MiB on Windows x64 compared with the no-VLM build.
+
+The Windows job passed tests, both binary builds and all measurements, then reached its two-hour limit while saving the Rust cache. Its measurements were uploaded before cancellation; the cancelled job itself is not a green release-target check.
+
 ## OmniDocBench v1.6
 
 [OmniDocBench](https://github.com/opendatalab/OmniDocBench) (CVPR 2025) is the public benchmark for turning page images into Markdown: 1,651 pages, scored on text, display formulas, tables, and reading order. We ran anymd on all 1,651 pages with the official end2end evaluator, pinned by commit. anymd read each page image with `tesseract`, the way it reads any scan or image: it returns the recognised text and nothing else. There is no layout model and no table, formula, or reading-order recognition, and tesseract runs with its default English model.
@@ -214,9 +243,47 @@ The scores published by the model authors, for context, are self-reported and co
 | PaddleOCR-VL-1.6 | 96.34 |
 | GLM-OCR | 95.22 |
 
-This row measures anymd's scan and image path, which today is `tesseract` text recognition with no layout, table, or formula model. anymd's strength is documents that carry a text layer (PDF, Word, PowerPoint, Excel, EPUB, HTML), where it scores 96.3 on AgentDocBench above. The dataset ships page images only, so anymd's PDF engine is not measured here.
+This row measures anymd's scan and image path, which today is `tesseract` text recognition with no layout, table, or formula model. anymd's strength is documents that carry a text layer (PDF, Word, PowerPoint, Excel, EPUB, HTML), where it scores 96.4 on AgentDocBench above. The dataset ships page images only, so anymd's PDF engine is not measured here.
 
 The dataset is licensed for research use only. We download it at run time, evaluate anymd, and publish our own score; nothing from the dataset is redistributed. The method, pins, and rerun command are in [`bench/omnidocbench`](https://github.com/SylphxAI/anymd/tree/main/bench/omnidocbench). The scores above are the evaluator's own summary (`run_summary.json`).
+
+## Image and video extraction
+
+Images and video require different extractors; there is no combined score.
+The image row below reuses the historical OmniDocBench v1.6 evaluation above,
+not a measurement of the current anymd OCR model. TeleOCR is the highest-scoring
+alternative in that v1.6 comparison ([upstream leaderboard](https://github.com/opendatalab/OmniDocBench#evaluation-results));
+its 96.91 is a published model-author result, not our same-run measurement.
+
+For video **embedded subtitles**, the reference alternative is direct FFmpeg:
+it retains every authored cue in these fixtures and is the extractor anymd itself
+uses. The video rows are new, same-run measurements of the published anymd 8.5.1
+CLI and FFmpeg 6.1.1. They do not measure visual scene understanding or speech
+recognition. [Speech-to-text](#speech-to-text) below is a separate audio benchmark.
+
+| Dataset | Samples | Metric | anymd | Alternative | Evidence |
+|---|---|---|---|---|---|
+| OmniDocBench v1.6 page images | 1,651 pages | Overall, higher is better | 21.4 (8.1.0, English tesseract) | TeleOCR 96.91 (author-reported) | [Image method and pins](https://github.com/SylphxAI/anymd/tree/main/bench/omnidocbench) |
+| MP4 mov_text subtitle fixtures | 4 clips / 12 cues | Exact text + start-second recall | 91.7% (11/12) | FFmpeg 100% (12/12) | [Raw video results](https://github.com/SylphxAI/anymd/blob/main/bench/media/results.json) |
+| Matroska SubRip subtitle fixtures | 4 clips / 12 cues | Exact text + start-second recall | 91.7% (11/12) | FFmpeg 100% (12/12) | [Raw video results](https://github.com/SylphxAI/anymd/blob/main/bench/media/results.json) |
+
+The video datasets are small, MIT-licensed, authored regression fixtures: English,
+multiline text, CJK and repeated captions, muxed into three-second black videos.
+They are not representative film or lecture datasets. At
+**2026-10-08T02:07:30Z**, both tools converted all eight clips successfully on the
+same Linux x86_64 Build lease. anymd retained 11 of 12 cues in each dataset,
+dropping the second identical caption at a different timestamp; FFmpeg retained
+all 12. Precision was 100% for both. anymd's rolling-caption cleanup causes this
+loss; it is not a transcription error.
+
+Total extraction time was **2.108 s vs 1.128 s** (anymd vs FFmpeg) for MP4 and
+**2.412 s vs 1.155 s** for Matroska. Each tool ran once per clip, sequentially;
+times include process startup, exclude fixture generation, and are not throughput
+guarantees. anymd also probes metadata and renders Markdown; direct FFmpeg only
+extracts subtitles. The [video benchmark method and rerun commands](https://github.com/SylphxAI/anymd/tree/main/bench/media)
+include exact versions, scoring rules, fixture text and all outputs. Cue end times,
+subsecond timestamps, frame OCR, metadata accuracy and audio transcription were
+not measured in these video rows.
 
 ## Reproduce
 
@@ -244,3 +311,78 @@ the benchmark; commit the resulting `bench/results/<tool>.json` and the regenera
 
 The official `@modelcontextprotocol/server-pdf` is not included because it has no headless text path: it renders
 PDFs in an interactive viewer, and its `read_pdf_bytes` tool returns base64-encoded bytes.
+
+## Speech-to-text
+
+We selected **transcribe-cpp 0.2.4 / Qwen3-ASR-1.7B Q8_0** as the one local ASR
+runtime/model for every language. The crate built on all four benchmark targets:
+x86_64 Linux, aarch64 Linux, x86_64 macOS and x86_64 Windows. CrispASR failed on
+Linux arm64 and macOS x64; its optional standalone aligner is not required for ASR.
+Whisper appears below only as the historical benchmark control, not a shipping
+engine option.
+
+Source: [ASR run 36523821486](https://github.com/SylphxAI/anymd/actions/runs/36523821486),
+fixed-seed, revision-pinned samples; 200 utterances per Linux dataset. Qwen and
+whisper-turbo ran on CPU, four threads. Scores were recalculated from saved
+reference/hypothesis pairs, without rerunning inference.
+
+### Accuracy
+
+Lower is better. **Raw CER** here means the existing baseline: NFKC, lowercase,
+punctuation/symbol/space/control stripping and OpenCC t2s on both sides. It is
+not punctuation-sensitive literal raw-text CER. English uses the pinned Open ASR
+Leaderboard EnglishTextNormalizer and WER.
+
+**Normalised (bracketed Latin glosses removed, numerals unified)** applies the
+same transformations to references and hypotheses: remove Latin parenthetical
+annotations before stripping punctuation, then numeral ITN via cn2an 0.5.24
+(zh/yue) or kanjize 1.6.1 (ja). Parentheses containing CJK text or just numbers
+remain. This is a scoring-sensitivity diagnostic, not a verified ground-truth
+correction: annotations may be spoken, and generic numeral conversion may alter
+lexical numerals. Kana/kanji readings are not collapsed. Normalisation can make
+scores worse as well as better.
+
+| Dataset | Metric | Qwen raw | Qwen normalised (bracketed Latin glosses removed, numerals unified) | whisper-turbo raw | whisper-turbo normalised (same rules) |
+|---|---|---|---|---|---|
+| FLEURS en | WER | 4.54 | 4.54 | 6.33 | 6.33 |
+| FLEURS zh | CER | 7.73 | 2.53 | 9.21 | 5.03 |
+| FLEURS yue | CER | 5.41 | 3.89 | 12.10 | 12.29 |
+| FLEURS ja | CER | 5.93 | 5.85 | 4.80 | 4.65 |
+| LibriSpeech test-clean | WER | 2.00 | 2.00 | 2.23 | 2.23 |
+
+Mandarin Qwen normalized CER has a 95% utterance-bootstrap CI of [1.92, 3.22];
+whisper-turbo [4.30, 5.77]. Mandarin's original 602 errors include 372 deletions:
+removing Latin parenthetical annotations reduces deletions to 50 and total errors
+to 280; numeral ITN reduces total errors to 189. This explains most of the 7.73%
+raw score, rather than showing a model defect.
+
+**Accepted Japanese trade-off:** on this 200-utterance FLEURS sample, Qwen trails
+whisper-turbo (5.93 vs 4.80 raw CER). Japanese numeral-only diagnostics give
+5.79 vs 4.67; adding katakana-to-hiragana folding gives **5.56 vs 4.59**
+normalised CER. This separate diagnostic retains parenthetical annotations and
+the baseline OpenCC step; it is not the annotation-removal column above.
+Reproduce it with `python3 bench-asr/report.py RESULTS --cjk-diagnostics
+--normalizer-dir NORMALIZERS` using the saved run transcripts. Converting everything to
+kana readings is a different metric and still trails (4.50 vs 3.74); it cannot
+be presented as corrected CER. Real errors remain, including `地殻` → `近く`
+and `Taipei` → `大阪`. We accept this gap to use one model across languages.
+
+**No official-score reproduction claim.** [Qwen's published evaluation](https://github.com/QwenLM/Qwen3-ASR/tree/7c6daf77a2421100f5fb066495372c00129d39ff#evaluation)
+uses bfloat16, vLLM, greedy decoding, max_new_tokens=1024 and no language hint.
+The [technical report](https://arxiv.org/html/2601.21337v2) uses CER for Mandarin
+and Cantonese but does not publish its complete text-normalisation protocol.
+Our CPU-quantized, language-hinted, sampled runs differ; the bootstrap intervals
+cover sample variation, not those protocol differences.
+
+### Runtime cost
+
+On the full Linux samples transcribe-cpp's model-load-excluded RTF was 0.574
+(en), 0.535 (zh), 0.559 (yue), 0.369 (ja), and 0.631 (LibriSpeech); RTF is compute
+time divided by audio time. See the original run's report for runner CPUs and
+peak memory; these are benchmark observations, not throughput guarantees.
+
+The harness and all SHA-256/revision pins are in
+[`bench-asr/`](https://github.com/SylphxAI/anymd/tree/main/bench-asr).
+`report.py --cjk-diagnostics` recalculates both scoring columns from saved
+`summary.json` / `results.jsonl` jobs. Its additional scoring dependencies are
+cn2an 0.5.24 and kanjize 1.6.1; the English normalizer is pinned in `pins.json`.

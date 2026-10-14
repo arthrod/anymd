@@ -1,12 +1,66 @@
+---
+description: "The four anymd MCP tools (read, outline, search, inspect), their arguments and example output."
+---
+
 # MCP tools
 
-anymd exposes three tools.
+anymd exposes four tools.
 
 | Tool | Use it to |
 |---|---|
+| [`outline`](#outline) | Navigate a heading tree, without a model or API key |
 | [`read`](#read) | Turn a file, URL, or folder into Markdown |
 | [`search`](#search) | Find text across files, folders, and URLs |
 | [`inspect`](#inspect) | Go deeper on a PDF: render pages, crop regions, OCR, JSON structure, compare |
+
+Only `source` is required for `read` and `outline`; only `query` is required for
+`search`; `inspect` requires `operation` and `sources`, with further arguments
+needed for the chosen operation as described below. Other options can be omitted
+to use their defaults. Nullable options do not need an explicit `null`, including
+`read`'s `transcript`, `download_asr_model`, `images` and `revisions`, and `search`'s
+`case_sensitive` and `whole_word`. The MCP input schemas reflect this distinction
+so clients can validate minimal calls before sending them.
+
+## outline
+
+Get the document tree before reading a long document. PDF uses bookmarks when
+present, otherwise the headings detected by the layout engine. Word uses headings,
+PowerPoint uses slides, EPUB uses its EPUB 3 TOC or EPUB 2 NCX (chapters and headings
+when neither is present), and HTML and Markdown use headings. A document with no
+headings gets unit nodes. No model, vector database, or API key is needed.
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `source` | string | required | File path or `http(s)` URL |
+| `format` | `"json"` \| `"tree"` | `"json"` | Machine-readable preorder nodes or an indented tree |
+| `ocr` | boolean or `"auto"` \| `"vlm"` \| `"tesseract"` | `false` | OCR image-only pages; use the same option in node reads. `true` inherits `ANYMD_OCR`; a named engine overrides it. |
+| `images` | `"none"` \| `"refs"` | `"none"` | Embedded images; use the same option in node reads |
+| `revisions` | string | `"markup"` | Word revision mode; use the same option in node reads |
+
+```json
+{ "source": "report.pdf", "format": "tree" }
+```
+
+Each node has `id`, `title`, `level`, `from`, `to`, `start`, `end`, `children`, and
+`path`. `from` and `to` are inclusive 1-based units: pages, slides, sheets or chapters.
+`start` and `end` are a half-open **UTF-8 byte** range in the canonical Markdown
+body (not front matter): each unit's trimmed Markdown followed by two newlines,
+with `<!-- unit label -->` and two newlines before it for PDF or multi-unit files.
+The canonical body uses these extraction options: no OCR or embedded images by
+default, and Word revision markup. Node reads use these same defaults; regular
+reads without `node` keep automatic OCR and image refs. Pass matching `ocr`,
+`images`, and `revisions` options to outline and read when changing them. Search
+uses the default outline extraction options.
+`children` counts immediate children; nodes are in preorder and `level` gives
+heading depth. `n1` is the document root; children are `n1.1`, `n1.1.1`, and so on.
+IDs are deterministic for an unchanged document and extraction options, not durable
+identifiers across edits. A PDF bookmark resolves to its page, so bookmarks sharing
+a page can overlap. TOCs may omit sections; text outside a section belongs to the
+nearest containing node, including the root.
+
+Read a node with `{ "source": "report.pdf", "node": "n1.2" }`. If it stops, repeat
+both `source` and `node` with the returned `cursor`. `pages` intersects the node's
+unit range. Search hits include a node id and title path for this same navigation.
 
 ## read
 
@@ -15,14 +69,15 @@ Any file, URL, or directory → Markdown.
 | Argument | Type | Default | Description |
 |---|---|---|---|
 | `source` | string | required | File path, `http(s)` URL, or directory. A directory returns the list of readable files. |
+| `node` | string | – | Read the section id from `outline`; includes child sections. Unknown ids return an error. |
 | `pages` | string | all | Pages (PDF), slides, sheets, or chapters, e.g. `"1-5,8"` |
 | `max_tokens` | number ≥ 500 | `20000` | Token budget. Longer documents stop at a page/slide/chapter boundary and end with a cursor. |
 | `cursor` | string | – | Continue a previous read with the cursor from its last line |
-| `ocr` | boolean | automatic | OCR images and image-only PDF pages with a local `tesseract`. Automatic when tesseract is installed; `false` disables. |
+| `ocr` | `"auto"` \| `"vlm"` \| `"tesseract"` \| boolean | automatic | Local OCR for images and scanned PDF pages. Auto uses explicitly installed models, otherwise tesseract. No automatic downloads. `false` disables; `true` enables the default runtime (`ANYMD_OCR` when set). See [local OCR](./cli#local-document-ocr). |
 | `revisions` | `"markup"` \| `"accept"` \| `"reject"` | `"markup"` | Word tracked changes and comments. `markup` writes them as CriticMarkup with each change's author and date; `accept` or `reject` gives the text with every change accepted or rejected, without comments (see [Word](./formats#word)). A document with no tracked changes and no comments reads the same either way. |
 | `images` | `"refs"` \| `"none"` | `"refs"` | Images embedded in PDFs, DOCX, PPTX and EPUB files. `refs` saves each meaningful raster image to the anymd cache and marks it in the Markdown (see [Embedded images](./formats#embedded-images)); `none` leaves images out. |
-| `transcript` | boolean | `false` | Transcribe audio/video with a local whisper.cpp |
-| `download_whisper_model` | boolean | `false` | Implies `transcript`; downloads the ggml model (base.en, 148 MB, SHA-256 verified) into the anymd cache when none is installed |
+| `transcript` | boolean | `false` | Transcribe audio/video with bundled Qwen3-ASR |
+| `download_asr_model` | boolean | `false` | Implies `transcript`; downloads Qwen3-ASR-1.7B Q8 weights (2.19 GB, SHA-256 verified) into the anymd cache when none is installed |
 
 ```json
 { "source": "papers/attention.pdf" }
@@ -50,6 +105,10 @@ showing: pages 1-9
 
 <!-- Stopped at the 20000-token budget. Continue with cursor: "10", or pick pages, or raise max_tokens. -->
 ```
+
+### Scanned pages
+
+A PDF page with no text layer that images cover is a scan. When OCR does not read it (not configured, or `ocr: false`), `read` says so instead of returning an empty page. The page marker explains how to enable local OCR: run `anymd setup ocr` to opt into downloading the OCR engine and ~2 GB of model weights, then retry with `ocr: true`. Documents stay on your machine; setting `ocr: true` alone does not download models. The front matter lists `scanned_pages: [3, 5]` (page numbers shown in this response), and when every page shown is a scan the body opens with the same guidance. Pages with text are unchanged, and a page that OCR reads gets no marker.
 
 ### Cursor and pagination
 
@@ -100,6 +159,7 @@ Go deeper on a PDF. `inspect` returns JSON, for the cases where an agent needs g
 
 | `operation` | What it does |
 |---|---|
+| `cite_check` | (anymd Pro) [Check a quoted passage at a page and bounding box](./cite-check), without a model or truth claim |
 | `inspect` | Page count, metadata, and per-page facts |
 | `render_page` | Render pages to PNG images |
 | `extract_regions` | Crop regions (bounding boxes) out of rendered pages |
@@ -118,7 +178,8 @@ Go deeper on a PDF. `inspect` returns JSON, for the cases where an agent needs g
 | `max_regions` | number 1–100 | Region cap |
 | `max_pixels_per_page` | number | Pixel cap per rendered page |
 | `include_image` | boolean | Include the rendered PNG in the response |
-| `languages` | string[] | OCR languages, e.g. `["eng", "chi_tra"]` |
+| `ocr` | `"auto"` \| `"vlm"` \| `"tesseract"` | Engine for `ocr_pages`; omit to use the configured command provider. |
+| `languages` | string[] | Tesseract OCR languages, e.g. `["eng", "chi_tra"]`; doc-VLM detects the language. |
 | `timeout_ms` | number | Time limit for external tools (1,000–300,000) |
 | `max_output_chars` | number | Output cap (1,000–1,000,000) |
 

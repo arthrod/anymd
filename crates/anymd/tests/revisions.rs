@@ -18,15 +18,17 @@ fn fixture(name: &str) -> String {
 
 fn args(name: &str, revisions: Option<&str>) -> ReadArgs {
     ReadArgs {
+        timeline: None,
         source: fixture(name),
         pages: None,
         max_tokens: None,
         cursor: None,
-        ocr: Some(false),
+        ocr: Some(anymd::ocr_vlm::OcrSelection::Enabled(false)),
         transcript: None,
-        download_whisper_model: None,
+        download_asr_model: None,
         images: Some("none".into()),
         revisions: revisions.map(str::to_string),
+        node: None,
     }
 }
 
@@ -57,7 +59,10 @@ fn each_choice_is_read_and_cached_on_its_own() {
         assert_eq!(read("tracked-changes.docx", Some("markup")), markup);
 
         let accepted = read("tracked-changes.docx", Some("accept"));
-        assert!(accepted.contains("I really love font-styles."), "{accepted}");
+        assert!(
+            accepted.contains("I really love font-styles."),
+            "{accepted}"
+        );
         assert!(!accepted.contains('{'), "accept: {accepted}");
 
         let rejected = read("tracked-changes.docx", Some("reject"));

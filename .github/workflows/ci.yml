@@ -1,30 +1,45 @@
+# Merge-queue gate (docs/optimistic-merge.md): fast lanes only; the heavy suite is verify.yml.
 name: CI
 
 on:
+  workflow_dispatch:
   merge_group:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Least privilege for GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions).
 permissions:
   contents: read
+  actions: read
+  checks: read
+  pull-requests: read
 
 concurrency:
-  # Fast Trunk: supersede obsolete runs for the same PR or branch tip.
+  # Fast Trunk: supersede obsolete runs of a pull request only; merge queue
+  # and manual runs always finish.
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Stop the line while the trunk's newest Verify run is red and its way back is in
+  # motion (docs/optimistic-merge.md). Merge groups only; ships in observe mode.
+  main-state:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: SylphxAI/.github/.github/actions/main-red-gate@0e60d27730cdd0148c5649881d82c5bd58996931 # main 0e60d27 (pin floor)
+        with:
+          mode: observe
+
   plain-language:
     name: Plain language
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
@@ -37,7 +52,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -45,23 +60,69 @@ jobs:
       - name: Non-v7 ids on added lines (owner standards/identifiers.md)
         uses: SylphxAI/.github/.github/actions/identifiers@e4a5ea41cbcc87cd93914f89f0d7c3981c868bf9
 
+  # Pull requests that only touch these files skip the heavy jobs; the required
+  # checks (ci-ok and every job name) still report. docs/** is not listed
+  # because CI builds the docs.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.result.outputs.code }}
+    steps:
+      - name: Changed files that need the full CI
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!LICENSE'
+              - '!CHANGELOG.md'
+              - '!CONTRIBUTING.md'
+              - '!SECURITY.md'
+              - '!.github/ISSUE_TEMPLATE/**'
+
+      # Merge queue, manual and every other event always run everything.
+      - name: Decide
+        id: result
+        env:
+          FILTERED: ${{ steps.filter.outputs.code }}
+        run: echo "code=${FILTERED:-true}" >> "$GITHUB_OUTPUT"
+
+  # Fast checks: none of these compile the Rust workspace.
   validate:
     name: Validate Code Quality
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Validate GitHub Actions workflows
         run: bash scripts/check-github-actions.sh
 
       - name: Brand home matches its masters
-        run: python3 brand/build.py --check
+        uses: SylphxAI/.github/.github/actions/brand@a6c81b4bcda66bf624f0a68e25e63b3c0ed043eb # shared brand generator
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: '1.4.0'
+
+      - name: Cache Bun packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
@@ -78,6 +139,14 @@ jobs:
       - name: Public copy matches product.json and benchmark results
         run: bun run check:copy
 
+      - name: Test Python API and wheel packaging without framework dependencies
+        run: |
+          python3 -m unittest discover -s packages/pypi/tests -v
+          python3 -m unittest discover -s bench/navigation -p 'test_*.py' -v
+
+      - name: Test release recovery and vendored crate version checks
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Every manifest carries the same version
         run: bun run check:versions
 
@@ -87,97 +156,58 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Audit Rust dependencies
-        run: bash scripts/check-cargo-advisories.sh
-
-      # Packages every publishable crate the way `cargo publish` does (builds each
-      # from its packed sources against the others), then keeps each under the
-      # crates.io limit of 10 MB.
-      - name: Package the crates for crates.io
+      - name: ASR scoring regression tests
         run: |
-          cargo package --locked -p anymd-adobe-cmap-parser -p anymd-pdf-extract -p anymd-pdf -p anymd-formats -p anymd-core -p anymd
-          bash scripts/publish-crates.sh --list
-          oversized=$(find target/package -name '*.crate' -size +9M)
-          if [ -n "$oversized" ]; then echo "over 9 MB: $oversized" >&2; exit 1; fi
-          ls -l target/package/*.crate
-
-      - name: Build the anymd binary
-        run: bun run build
-
-      - name: Fetch Markdown regression corpus
-        run: bash scripts/fetch-markdown-corpus.sh "${RUNNER_TEMP}/markdown-corpus"
-
-      - name: Rust core tests
-        env:
-          ANYMD_CORPUS_DIR: ${{ runner.temp }}/markdown-corpus
-        run: bun run test:rust
-
-      # The docs playground runs anymd-pdf + anymd-formats in the browser; keep
-      # them free of native-only dependencies. (docs:build below degrades to a
-      # "not in this build" notice when the .wasm is absent.)
-      - name: Check WebAssembly build
-        run: |
-          rustup target add wasm32-unknown-unknown
-          cargo check -p anymd-wasm --target wasm32-unknown-unknown
-
-      - name: Run Tests and Check Coverage
-        run: bun run test:cov
-
-      - name: Build docs
-        run: bun run docs:build
-
-      - name: Upload coverage reports
-        if: ${{ !cancelled() && hashFiles('coverage/**') != '' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 3
-
-  # Queue-only: macOS and Windows run when a pull request enters the merge
-  # queue, so they gate the merge without doubling the pull request load. GitHub-hosted
-  # standard runners are free for public repositories (owner standards/dx.md).
-  other-os:
-    if: github.event_name == 'merge_group'
-    name: Test other OS
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust workspace tests
-        run: cargo test --locked --workspace --no-fail-fast
-
-      - name: Build the anymd binary
-        run: cargo build --release --locked -p anymd
-
-      # The npm launcher (packages/anymd/bin/anymd.js) starts the native binary.
-      - name: Launcher smoke test
-        shell: bash
-        run: |
-          set -euo pipefail
-          node packages/anymd/bin/anymd.js version
-          node packages/anymd/bin/anymd.js test/fixtures/sample.pdf > sample.md
-          grep -q '<!-- page 1 -->' sample.md
+          python3 -m venv "$RUNNER_TEMP/asr-scoring"
+          "$RUNNER_TEMP/asr-scoring/bin/pip" install jiwer==4.0.0 opencc-python-reimplemented==0.1.7 cn2an==0.5.24 kanjize==1.6.1
+          "$RUNNER_TEMP/asr-scoring/bin/python" -m unittest discover -s bench-asr -p test_report.py
 
   security-secrets:
     name: security:secrets
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0 # full history for the new-commit range
       - name: Secret scan (ADR-6 security:secrets)
-        uses: SylphxAI/.github/.github/actions/secret-scan@main
+        uses: SylphxAI/.github/.github/actions/secret-scan@da18ca4ebeeb7509019e3aac3f10763e0352b2d7
+
+  # The full suite on a pull request that is ready; never in a merge group or a draft.
+  suite:
+    needs: changes
+    if: github.event_name != 'merge_group' && !github.event.pull_request.draft
+    uses: ./.github/workflows/verify.yml
+    with:
+      code: ${{ needs.changes.outputs.code }}
+    secrets: inherit
+
+  # No new departure from the default stack (docs/stack-conformance.md in
+  # SylphxAI/.github): a backend service off Rust or a migration engine other
+  # than atlas fails unless .github/stack-departures.txt, which may only
+  # shrink, already lists it. Reads git objects only; a few seconds.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          filter: blob:none
+      - uses: SylphxAI/.github/.github/actions/stack-conformance@bc664ac7410c00d233fe4f729b6747969a4a9bed # SylphxAI/.github#208
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [main-state, changes, plain-language, identifiers, validate, security-secrets, suite, stack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: SylphxAI/.github/.github/actions/needs-pass@05ac6474b96425bcb4965addd025a93e061b66c4
+        with:
+          needs: ${{ toJSON(needs) }}
+          required: changes
+          required-unless-merge-group: ${{ github.event.pull_request.draft && ' ' || 'suite' }}

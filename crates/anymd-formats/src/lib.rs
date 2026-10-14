@@ -19,7 +19,7 @@ mod revise;
 #[cfg(feature = "native")]
 mod tool;
 /// Without `native` (WebAssembly) no helper binary exists: every lookup misses,
-/// so OCR, ffprobe, and whisper paths fall back to their no-tool output.
+/// so OCR, ffprobe, and ASR paths fall back to their no-tool output.
 #[cfg(not(feature = "native"))]
 mod tool {
     use std::path::{Path, PathBuf};
@@ -43,7 +43,11 @@ mod tool {
         None
     }
 
-    pub(crate) fn run<I, S>(_program: &Path, _args: I, _timeout: Duration) -> Result<ToolOutput, String>
+    pub(crate) fn run<I, S>(
+        _program: &Path,
+        _args: I,
+        _timeout: Duration,
+    ) -> Result<ToolOutput, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
@@ -68,8 +72,8 @@ mod tool {
         Err("temp files are not available in this build".into())
     }
 }
+pub mod asr;
 pub mod video;
-pub mod whisper;
 pub mod xlsx;
 
 mod ooxml;
@@ -91,6 +95,9 @@ pub struct Converted {
     pub format: String,
     pub title: Option<String>,
     pub sections: Vec<Section>,
+    /// Native table of contents: zero-based depth, title, 1-based section.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outline: Vec<(usize, String, Option<u32>)>,
     /// Small key/value facts worth a header line (author, dimensions, duration...).
     pub metadata: Vec<(String, String)>,
 }
@@ -101,11 +108,11 @@ pub struct Options {
     pub base_url: Option<String>,
     /// Opt-in OCR for images (runs a local `tesseract` binary when present).
     pub ocr: bool,
-    /// Opt-in transcript for audio/video (runs a local whisper.cpp binary when present).
+    /// Opt-in transcript for audio/video (runs the bundled transcribe-cpp Qwen3-ASR runtime).
     pub transcript: bool,
-    /// With `transcript`: download the configured ggml whisper model into the
-    /// anymd cache when none is installed (see [`whisper`]).
-    pub download_whisper_model: bool,
+    /// With `transcript`: download the pinned Qwen3-ASR model into the
+    /// anymd cache when none is installed (see [`asr`]).
+    pub download_asr_model: bool,
     /// Source path when the input came from disk (video/ffprobe needs a path).
     pub path: Option<std::path::PathBuf>,
     /// Export images embedded in DOCX, PPTX and EPUB files into this store and
@@ -230,12 +237,15 @@ pub fn detect(path: Option<&Path>, head: &[u8]) -> Option<Format> {
         Some("tsv" | "tab") => Some(Format::Tsv),
         Some("epub") => Some(Format::Epub),
         Some("html" | "htm" | "xhtml") => Some(Format::Html),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "tiff" | "tif" | "bmp") => Some(Format::Image),
-        Some("mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mp3" | "wav" | "m4a" | "flac" | "ogg") => {
-            Some(Format::Video)
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "tiff" | "tif" | "bmp") => {
+            Some(Format::Image)
         }
+        Some(
+            "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mp3" | "wav" | "m4a" | "flac" | "ogg",
+        ) => Some(Format::Video),
         _ => {
-            let text_head = String::from_utf8_lossy(&head[..head.len().min(512)]).to_ascii_lowercase();
+            let text_head =
+                String::from_utf8_lossy(&head[..head.len().min(512)]).to_ascii_lowercase();
             let trimmed = text_head.trim_start();
             if trimmed.starts_with("<!doctype html") || trimmed.starts_with("<html") {
                 Some(Format::Html)
@@ -277,6 +287,7 @@ pub fn convert(format: Format, bytes: &[u8], options: &Options) -> Result<Conver
         Format::Image => image::convert(bytes, options),
         Format::Video => video::convert(bytes, options),
         Format::Text => Ok(Converted {
+            outline: Vec::new(),
             format: "text".into(),
             title: None,
             sections: vec![Section {
@@ -286,6 +297,7 @@ pub fn convert(format: Format, bytes: &[u8], options: &Options) -> Result<Conver
             metadata: Vec::new(),
         }),
         Format::Subtitles => Ok(Converted {
+            outline: Vec::new(),
             format: "subtitles".into(),
             title: None,
             sections: vec![Section {
@@ -322,7 +334,9 @@ pub fn markdown_table(rows: &[Vec<String>]) -> String {
         // Compact pipe tables: padding spaces cost ~20% more tokens.
         out.push('|');
         for column in 0..width {
-            out.push_str(&table_cell(row.get(column).map(String::as_str).unwrap_or("")));
+            out.push_str(&table_cell(
+                row.get(column).map(String::as_str).unwrap_or(""),
+            ));
             out.push('|');
         }
         out.push('\n');

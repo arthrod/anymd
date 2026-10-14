@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Dependency order: forks first, then the crates that use them, the binary last.
-CRATES=(anymd-adobe-cmap-parser anymd-pdf-extract anymd-pdf anymd-formats anymd-core anymd)
+CRATES=(anymd-oar-ocr-vl anymd-adobe-cmap-parser anymd-pdf-extract anymd-pdf anymd-formats anymd-core anymd-ocr-vlm anymd)
 
 version_of() {
   cargo metadata --no-deps --format-version 1 |
@@ -14,7 +14,7 @@ version_of() {
 
 published() {
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' -A 'anymd-release (contact@sylphx.com)' \
+  code=$(curl -s -o /dev/null -w '%{http_code}' -A 'anymd-release (hi@sylphx.com)' \
     "https://crates.io/api/v1/crates/$1/$2")
   case "$code" in
     200) return 0 ;;

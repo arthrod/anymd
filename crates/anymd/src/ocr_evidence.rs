@@ -20,17 +20,17 @@ const OCR_COMMAND_ENV: &str = "MCP_PDF_OCR_COMMAND";
 const OCR_ARGS_ENV: &str = "MCP_PDF_OCR_ARGS_JSON";
 const OCR_PRESET_ENV: &str = "MCP_PDF_OCR_PRESET";
 const MAX_SOURCES_PER_REQUEST: usize = 32;
-const MAX_REQUEST_OCR_TIMEOUT_MS: u64 = 600_000;
+pub(crate) const MAX_REQUEST_OCR_TIMEOUT_MS: u64 = 600_000;
 const MAX_REQUEST_OCR_OUTPUT_CHARS: usize = 2_000_000;
 const MAX_REQUEST_OCR_PROVIDER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_OCR_REQUESTS: usize = 2;
 static ACTIVE_OCR_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
-struct OcrRequestPermit;
+pub(crate) struct OcrRequestPermit;
 
 impl OcrRequestPermit {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
         ACTIVE_OCR_REQUESTS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_OCR_REQUESTS).then_some(active + 1)
@@ -123,6 +123,44 @@ struct ProviderConfig {
     output_format: OcrOutputFormat,
 }
 
+impl ProviderConfig {
+    fn builtin_vlm(&self) -> bool {
+        self.args_template
+            .first()
+            .is_some_and(|arg| arg == "__ocr-vlm-worker")
+    }
+
+    fn page_timeout(&self, requested: Option<u64>) -> Result<u64, String> {
+        requested.map_or_else(
+            || {
+                if self.builtin_vlm() {
+                    crate::ocr_vlm::page_timeout()
+                } else {
+                    Ok(DEFAULT_TIMEOUT_MS)
+                }
+            },
+            Ok,
+        )
+    }
+
+    fn stamp_provenance(&self, output: &mut Value) {
+        let mut provenance = output
+            .get("provenance")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if self.builtin_vlm() {
+            provenance.insert("engine".into(), json!("candle"));
+            provenance.insert("source".into(), json!("paddleocr-vl-1.6"));
+            provenance.insert("layout".into(), json!("pp-doclayoutv3"));
+        } else {
+            provenance.insert("engine".into(), json!("external-command"));
+            provenance.insert("source".into(), json!("ocr-provider"));
+        }
+        output["provenance"] = json!(provenance);
+    }
+}
+
 fn parse_args(value: &Value) -> Result<PdfEvidenceArgs, rmcp::ErrorData> {
     let args: PdfEvidenceArgs = serde_json::from_value(value.clone()).map_err(|error| {
         rmcp::ErrorData::invalid_params(format!("Invalid pdf_evidence arguments: {error}"), None)
@@ -205,7 +243,30 @@ fn provider_config_from(
     })
 }
 
-fn provider_config() -> Result<ProviderConfig, String> {
+fn provider_config(engine: Option<crate::ocr_vlm::OcrEngine>) -> Result<ProviderConfig, String> {
+    let selected = match engine {
+        Some(engine) => Some(engine),
+        None if env::var(OCR_COMMAND_ENV).is_err() => env::var("ANYMD_OCR")
+            .ok()
+            .map(|value| crate::ocr_vlm::OcrSelection::parse(&value).map(|s| s.engine()))
+            .transpose()?,
+        None => None,
+    };
+    if let Some(engine) = selected {
+        if crate::ocr_vlm::requested(engine) {
+            let command = crate::ocr_vlm::worker_command()?;
+            return Ok(ProviderConfig {
+                command: command.to_string_lossy().into_owned(),
+                args_template: vec![
+                    "__ocr-vlm-worker".into(),
+                    "{input}".into(),
+                    crate::ocr_vlm::max_tokens()?.to_string(),
+                ],
+                output_format: OcrOutputFormat::Auto,
+            });
+        }
+        return provider_config_from(None, Some("tesseract-tsv".into()), None);
+    }
     provider_config_from(
         env::var(OCR_COMMAND_ENV).ok(),
         env::var(OCR_PRESET_ENV).ok(),
@@ -291,6 +352,11 @@ fn normalize_words(value: &Value, scale: f64) -> Option<Vec<Value>> {
                 return None;
             }
             let mut output = json!({"text": text});
+            for key in ["reading_order", "region_type", "layout_confidence"] {
+                if let Some(value) = word.get(key) {
+                    output[key] = value.clone();
+                }
+            }
             if let Some(confidence) = word.get("confidence").and_then(normalize_confidence) {
                 output["confidence"] = json!(confidence);
             }
@@ -531,6 +597,19 @@ fn normalize_output(
         .unwrap_or(trimmed);
     let (text, truncated) = truncate_utf16(raw_text, max_output_chars);
     let mut output = json!({"text": text});
+    let mut provenance = serde_json::Map::new();
+    for key in ["model_revision", "device", "quantization"] {
+        if let Some(value) = parsed
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+        {
+            provenance.insert(key.into(), json!(value));
+        }
+    }
+    if !provenance.is_empty() {
+        output["provenance"] = json!(provenance);
+    }
     if let Some(confidence) = parsed
         .as_ref()
         .and_then(|value| value.get("confidence"))
@@ -553,30 +632,82 @@ fn normalize_output(
     {
         output["language"] = json!(language);
     }
+    let mut warnings = Vec::new();
     if truncated {
-        output["warnings"] = json!([format!(
+        warnings.push(format!(
             "OCR output truncated to {max_output_chars} characters."
-        )]);
+        ));
+    }
+    if let Some(stops) = parsed
+        .as_ref()
+        .and_then(|value| value.get("truncated"))
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        warnings.push(format!(
+            "Doc-VLM generation stopped in {stops} regions (token limit or repetition)."
+        ));
+    }
+    if !warnings.is_empty() {
+        output["warnings"] = json!(warnings);
     }
     output
 }
 
+// Existing provider normalization emits bottom-left boxes divided by scale.
+// Recover raster corners and use the actual render inverse, not scale alone.
+fn restore_render_geometry(output: &mut Value, transform: [f64; 6], scale: f64, height: u32) {
+    if let Some(words) = output.get_mut("words").and_then(Value::as_array_mut) {
+        for word in words {
+            let mapped = word
+                .get("bounding_box")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<anymd_core::render::BoundingBox>(value).ok()
+                })
+                .and_then(|b| {
+                    anymd_core::render::pdf_box_from_pixel_box(
+                        transform,
+                        anymd_core::render::BoundingBox {
+                            left: b.left * scale,
+                            right: b.right * scale,
+                            bottom: f64::from(height) - b.top * scale,
+                            top: f64::from(height) - b.bottom * scale,
+                        },
+                    )
+                    .ok()
+                });
+            if let Some(b) = mapped {
+                word["bounding_box"] = json!(b);
+            } else if let Some(object) = word.as_object_mut() {
+                object.remove("bounding_box");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadOcrOptions {
+    pub(crate) engine: Option<crate::ocr_vlm::OcrEngine>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) exact_geometry: bool,
     pub(crate) scale: f64,
     pub(crate) max_pages: usize,
     pub(crate) max_pixels_per_page: u64,
-    pub(crate) timeout_ms: u64,
+    pub(crate) timeout_ms: Option<u64>,
     pub(crate) max_output_chars: usize,
 }
 
 impl Default for ReadOcrOptions {
     fn default() -> Self {
         Self {
+            engine: None,
+            deadline: None,
+            exact_geometry: false,
             scale: 2.0,
             max_pages: 5,
             max_pixels_per_page: 16_000_000,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
+            timeout_ms: None,
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
         }
     }
@@ -602,8 +733,22 @@ pub(crate) fn run_read_ocr(
             })
             .collect();
     }
-    let config = match provider_config() {
+    let config = match provider_config(options.engine) {
         Ok(config) => config,
+        Err(error) => {
+            return sources
+                .iter()
+                .map(|(source, _)| SourceOcrOutcome {
+                    source_index: source.source_index(),
+                    pages: Vec::new(),
+                    warnings: Vec::new(),
+                    error: Some(error.clone()),
+                })
+                .collect()
+        }
+    };
+    let timeout_ms = match config.page_timeout(options.timeout_ms) {
+        Ok(timeout) => timeout,
         Err(error) => {
             return sources
                 .iter()
@@ -631,7 +776,9 @@ pub(crate) fn run_read_ocr(
         }
     };
 
-    let request_deadline = Instant::now() + Duration::from_millis(MAX_REQUEST_OCR_TIMEOUT_MS);
+    let request_deadline = options
+        .deadline
+        .unwrap_or_else(|| Instant::now() + Duration::from_millis(MAX_REQUEST_OCR_TIMEOUT_MS));
     let mut request_budget = RequestOcrBudget::default();
     let mut render_budget = RequestWorkBudget::default();
     let languages = Vec::new();
@@ -676,7 +823,7 @@ pub(crate) fn run_read_ocr(
                 if let Err(error) = request_budget.ensure_available() {
                     return SourceOcrOutcome {
                         source_index: rendered.source_index,
-                        pages: Vec::new(),
+                        pages: if options.exact_geometry { pages } else { Vec::new() },
                         warnings: rendered.warnings,
                         error: Some(error),
                     };
@@ -690,7 +837,7 @@ pub(crate) fn run_read_ocr(
                 if remaining_ms == 0 {
                     return SourceOcrOutcome {
                         source_index: rendered.source_index,
-                        pages: Vec::new(),
+                        pages: if options.exact_geometry { pages } else { Vec::new() },
                         warnings: rendered.warnings,
                         error: Some(format!(
                             "Request exceeds OCR provider time limit of {MAX_REQUEST_OCR_TIMEOUT_MS} milliseconds."
@@ -703,7 +850,7 @@ pub(crate) fn run_read_ocr(
                     u64::from(page.page),
                     &rendered.source,
                     &languages,
-                    options.timeout_ms.min(remaining_ms),
+                    timeout_ms.min(remaining_ms),
                     options.max_output_chars,
                 ) {
                     Ok(stdout) => stdout,
@@ -711,7 +858,7 @@ pub(crate) fn run_read_ocr(
                         let _ = request_budget.charge_failed_provider(error.charge_bytes);
                         return SourceOcrOutcome {
                             source_index: rendered.source_index,
-                            pages: Vec::new(),
+                            pages: if options.exact_geometry { pages } else { Vec::new() },
                             warnings: rendered.warnings,
                             error: Some(error.message),
                         };
@@ -725,31 +872,33 @@ pub(crate) fn run_read_ocr(
                     config.output_format,
                     Some(f64::from(page.height)),
                 );
+                if options.exact_geometry {
+                    restore_render_geometry(&mut normalized, page.pdf_to_pixel, page.scale, page.height);
+                }
                 let output_chars = normalized["text"]
                     .as_str()
                     .map_or(0, |text| text.encode_utf16().count());
                 if let Err(error) = request_budget.charge(stdout.len(), output_chars) {
                     return SourceOcrOutcome {
                         source_index: rendered.source_index,
-                        pages: Vec::new(),
+                        pages: if options.exact_geometry { pages } else { Vec::new() },
                         warnings: rendered.warnings,
                         error: Some(error),
                     };
                 }
                 normalized["page"] = json!(page.page);
-                normalized["provider"] = json!("command");
+                normalized["provider"] = json!(if config.args_template.first().is_some_and(|a| a == "__ocr-vlm-worker") { "candle" } else { "command" });
                 normalized["source_render_evidence_id"] = json!(page.evidence_id);
                 normalized["source_render_scale"] = json!(page.scale);
                 normalized["source_render_width"] = json!(page.width);
                 normalized["source_render_height"] = json!(page.height);
-                normalized["provenance"] =
-                    json!({"engine": "external-command", "source": "ocr-provider"});
+                config.stamp_provenance(&mut normalized);
                 match serde_json::from_value::<OcrPage>(normalized) {
                     Ok(page) => pages.push(page),
                     Err(error) => {
                         return SourceOcrOutcome {
                             source_index: rendered.source_index,
-                            pages: Vec::new(),
+                            pages: if options.exact_geometry { pages } else { Vec::new() },
                             warnings: rendered.warnings,
                             error: Some(format!("Failed to normalize OCR provider output: {error}")),
                         }
@@ -790,7 +939,7 @@ pub fn ocr_pages(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
     if args.sources.is_empty() {
         return Ok(error_result("All PDF sources failed OCR: ".into()));
     }
-    let config = match provider_config() {
+    let config = match provider_config(args.ocr) {
         Ok(config) => config,
         Err(message) => {
             return Ok(error_result(format!(
@@ -809,7 +958,9 @@ pub fn ocr_pages(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
     let scale = args.scale.unwrap_or(2.0);
     let max_pages = args.max_pages.unwrap_or(5);
     let max_pixels = args.max_pixels_per_page.unwrap_or(16_000_000);
-    let timeout_ms = u64::from(args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS as u32));
+    let timeout_ms = config
+        .page_timeout(args.timeout_ms.map(u64::from))
+        .map_err(|e| rmcp::ErrorData::invalid_params(e, None))?;
     let max_output_chars = args
         .max_output_chars
         .map_or(DEFAULT_MAX_OUTPUT_CHARS, |value| value as usize);
@@ -895,13 +1046,20 @@ pub fn ocr_pages(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
                     .map_or(0, |text| text.encode_utf16().count());
                 request_budget.charge(stdout.len(), output_chars)?;
                 normalized["page"] = json!(page_number);
-                normalized["provider"] = json!("command");
+                normalized["provider"] = json!(if config
+                    .args_template
+                    .first()
+                    .is_some_and(|a| a == "__ocr-vlm-worker")
+                {
+                    "candle"
+                } else {
+                    "command"
+                });
                 normalized["source_render_evidence_id"] = page["evidence_id"].clone();
                 normalized["source_render_scale"] = page["scale"].clone();
                 normalized["source_render_width"] = page["width"].clone();
                 normalized["source_render_height"] = page["height"].clone();
-                normalized["provenance"] =
-                    json!({"engine": "external-command", "source": "ocr-provider"});
+                config.stamp_provenance(&mut normalized);
                 ocr_pages.push(normalized);
             }
             let mut result = json!({
@@ -949,6 +1107,123 @@ pub fn ocr_pages(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cite_check_ocr_uses_rotation_and_cropbox_inverse() {
+        let mut output = json!({"words": [{"text": "word", "bounding_box": {"left":15., "bottom":70., "right":35., "top":100.}}]});
+        restore_render_geometry(&mut output, [0., 2., 2., 0., -120., -100.], 2., 240);
+        assert_eq!(
+            output["words"][0]["bounding_box"],
+            json!({"left":70., "bottom":75., "right":100., "top":95.})
+        );
+        restore_render_geometry(&mut output, [0.; 6], 2., 240);
+        assert!(output["words"][0].get("bounding_box").is_none());
+    }
+
+    #[test]
+    fn vlm_evidence_keeps_order_boxes_and_layout_confidence_separate() {
+        let output = normalize_output(
+            r#"{"text":"cell","truncated":1,"words":[{"text":"cell","reading_order":2,"region_type":"table","layout_confidence":0.9,"bounding_box":{"left":10,"bottom":20,"right":30,"top":40}}]}"#,
+            1000,
+            &[],
+            2.0,
+            OcrOutputFormat::Auto,
+            Some(100.0),
+        );
+        assert_eq!(output["words"][0]["reading_order"], 2);
+        assert_eq!(output["words"][0]["bounding_box"]["left"], 5.0);
+        assert_eq!(output["words"][0]["layout_confidence"], 0.9);
+        assert!(output["words"][0].get("confidence").is_none());
+        assert!(output["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("generation stopped"));
+    }
+
+    #[test]
+    fn worker_evidence_survives_typed_page_and_fusion_without_recognition_confidence() {
+        let worker = json!({
+            "text": "cell", "model_revision": "pinned-revision", "device": "metal", "quantization": "none",
+            "words": [{"text": "cell", "reading_order": 2, "region_type": "table", "layout_confidence": 0.9,
+                "bounding_box": {"left": 10, "bottom": 20, "right": 30, "top": 40}}]
+        });
+        let mut normalized = normalize_output(
+            &worker.to_string(),
+            1000,
+            &[],
+            2.0,
+            OcrOutputFormat::Auto,
+            Some(100.0),
+        );
+        let config = ProviderConfig {
+            command: "anymd".into(),
+            args_template: vec!["__ocr-vlm-worker".into()],
+            output_format: OcrOutputFormat::Auto,
+        };
+        config.stamp_provenance(&mut normalized);
+        normalized["page"] = json!(1);
+        normalized["provider"] = json!("candle");
+        normalized["source_render_evidence_id"] = json!("render-1");
+        let page: OcrPage = serde_json::from_value(normalized).unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/sample.pdf");
+        let mut response = anymd_core::read_pdf::read_pdf_from_value(
+            &json!({"sources": [{"path": fixture}], "auto": false}),
+        )
+        .unwrap();
+        anymd_core::ocr_fusion::fuse_ocr_outcomes(
+            &mut response,
+            vec![SourceOcrOutcome {
+                source_index: 0,
+                pages: vec![page],
+                warnings: Vec::new(),
+                error: None,
+            }],
+        );
+        let layer = response.results[0]
+            .data
+            .as_ref()
+            .unwrap()
+            .ocr_text_layer
+            .as_ref()
+            .unwrap();
+        let fused = &layer["pages"][0];
+        assert_eq!(fused["words"][0]["reading_order"], 2);
+        assert_eq!(fused["words"][0]["region_type"], "table");
+        assert_eq!(fused["words"][0]["layout_confidence"], 0.9);
+        assert_eq!(fused["words"][0]["bounding_box"]["left"], 5.0);
+        assert!(fused.get("confidence").is_none());
+        assert!(fused["words"][0].get("confidence").is_none());
+        assert_eq!(fused["provenance"]["model_revision"], "pinned-revision");
+        assert_eq!(fused["provenance"]["device"], "metal");
+        assert_eq!(fused["provenance"]["quantization"], "none");
+        assert!(layer["summary"].get("average_confidence").is_none());
+    }
+
+    #[test]
+    fn provider_selection_controls_page_timeout_and_explicit_override() {
+        let external = ProviderConfig {
+            command: "external".into(),
+            args_template: vec!["{input}".into()],
+            output_format: OcrOutputFormat::Auto,
+        };
+        let builtin = ProviderConfig {
+            command: "anymd".into(),
+            args_template: vec!["__ocr-vlm-worker".into()],
+            output_format: OcrOutputFormat::Auto,
+        };
+        assert_eq!(ReadOcrOptions::default().timeout_ms, None);
+        assert_eq!(external.page_timeout(None).unwrap(), DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            builtin.page_timeout(None).unwrap(),
+            crate::ocr_vlm::page_timeout().unwrap()
+        );
+        assert_eq!(builtin.page_timeout(Some(1234)).unwrap(), 1234);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        assert!(crate::ocr_vlm::remaining_page_timeout(deadline).is_err());
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        assert!(crate::ocr_vlm::remaining_page_timeout(deadline).unwrap() <= 1000);
+    }
 
     #[test]
     fn normalizes_json_provider_output_and_utf16_truncation() {
@@ -1086,7 +1361,23 @@ mod tests {
 
     #[test]
     fn provider_concurrency_admission_is_process_wide_and_recoverable() {
-        let first = OcrRequestPermit::acquire().expect("first permit");
+        let mut first = crate::ocr_vlm::OcrRequest::acquire().expect("normal read permit");
+        let deadline = first.run_page(|deadline, _| Ok(deadline)).unwrap();
+        assert_eq!(
+            first.run_page(|deadline, _| Ok(deadline)).unwrap(),
+            deadline
+        );
+        assert!(first
+            .run_page::<()>(|_, _| Err("first page failed".into()))
+            .is_err());
+        let mut later_workers = 0;
+        assert!(first
+            .run_page(|_, _| {
+                later_workers += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(later_workers, 0);
         let second = OcrRequestPermit::acquire().expect("second permit");
         assert!(OcrRequestPermit::acquire()
             .expect_err("third request rejected")
@@ -1097,4 +1388,90 @@ mod tests {
         drop(replacement);
         assert_eq!(ACTIVE_OCR_REQUESTS.load(Ordering::Acquire), 0);
     }
+}
+
+/// Video raster input borrows the same OCR request permit; no PDF-space fiction.
+pub(crate) fn recognize_raster(
+    frame: &anymd_formats::video::timeline::DecodedFrame,
+    engine: crate::ocr_vlm::OcrEngine,
+    deadline: Instant,
+    permit: &OcrRequestPermit,
+) -> Result<crate::video_evidence::RasterObservation, String> {
+    let config = provider_config(Some(engine))?;
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    if remaining == 0 {
+        return Err("video request deadline exceeded".into());
+    }
+    let mut value = if config.builtin_vlm() {
+        let page = crate::ocr_vlm::recognize_admitted(&frame.png, deadline, permit)?;
+        let mut value = serde_json::to_value(&page).map_err(|e| e.to_string())?;
+        value["words"] = json!(page.regions.iter().map(|r| json!({"text":r.text,"region_type":r.label,"bounding_box":{"left":r.bbox[0],"right":r.bbox[2],"top":frame.metadata.height as f32-r.bbox[1],"bottom":frame.metadata.height as f32-r.bbox[3]}})).collect::<Vec<_>>());
+        value["model_revision"] = json!(crate::ocr_vlm::model_revision());
+        value
+    } else {
+        let stdout = run_provider(
+            &config,
+            &frame.png,
+            0,
+            &frame.metadata.sha256,
+            &[],
+            remaining.min(60_000),
+            200_000,
+        )
+        .map_err(|e| e.message)?;
+        normalize_output(
+            &stdout,
+            200_000,
+            &[],
+            1.0,
+            config.output_format,
+            Some(frame.metadata.height as f64),
+        )
+    };
+    config.stamp_provenance(&mut value);
+    let height = frame.metadata.height as f64;
+    let mut regions = Vec::new();
+    for word in value["words"].as_array().into_iter().flatten() {
+        let bbox = &word["bounding_box"];
+        let (Some(left), Some(right), Some(top), Some(bottom)) = (
+            bbox["left"].as_f64(),
+            bbox["right"].as_f64(),
+            bbox["top"].as_f64(),
+            bbox["bottom"].as_f64(),
+        ) else {
+            continue;
+        };
+        regions.push(crate::video_evidence::RasterRegion {
+            text: word["text"].as_str().unwrap_or("").into(),
+            left,
+            right,
+            top: height - top,
+            bottom: height - bottom,
+            geometry_level: if config.builtin_vlm() {
+                "ocr_region"
+            } else {
+                "ocr_word"
+            }
+            .into(),
+        });
+    }
+    if regions.is_empty() && !value["text"].as_str().unwrap_or("").is_empty() {
+        return Err("OCR text lacks frame geometry".into());
+    }
+    Ok(crate::video_evidence::RasterObservation {
+        provider: if config.builtin_vlm() {
+            "doc-vlm"
+        } else {
+            "command"
+        }
+        .into(),
+        model_revision: value["provenance"]["model_revision"]
+            .as_str()
+            .map(str::to_string),
+        coordinate_space: "frame_pixels_top_left".into(),
+        regions,
+        truncated: value["truncated"].as_bool().unwrap_or(false),
+    })
 }

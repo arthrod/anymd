@@ -7,7 +7,8 @@ use hayro::hayro_interpret::hayro_syntax::page::Rotation;
 use hayro::hayro_interpret::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{render, RenderCache, RenderSettings};
+use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
+use hayro::{render_into, RenderCache, RenderSettings};
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, GenericImageView, ImageEncoder, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,56 @@ pub struct RenderedPage {
     pub png: Vec<u8>,
     #[serde(skip)]
     pdf_to_pixel: [f64; 6],
+}
+
+impl RenderedPage {
+    /// The actual Hayro affine transform, including rotation and CropBox origin.
+    pub fn pdf_to_pixel_transform(&self) -> [f64; 6] {
+        self.pdf_to_pixel
+    }
+}
+
+/// Inverse of the render owner's transform. Pixel boxes use a top-left origin.
+/// All four corners are projected, so rotated/CropBox pages do not use a
+/// scale-only approximation. Invalid/singular transforms fail closed.
+pub fn pdf_box_from_pixel_box(
+    transform: [f64; 6],
+    bounds: BoundingBox,
+) -> Result<BoundingBox, RenderError> {
+    let [a, b, c, d, e, f] = transform;
+    let determinant = a * d - b * c;
+    if !transform.into_iter().all(f64::is_finite)
+        || !determinant.is_finite()
+        || determinant.abs() < f64::EPSILON
+    {
+        return Err(RenderError::invalid_request("Invalid render transform."));
+    }
+    if ![bounds.left, bounds.bottom, bounds.right, bounds.top]
+        .into_iter()
+        .all(f64::is_finite)
+        || bounds.right <= bounds.left
+        || bounds.top <= bounds.bottom
+    {
+        return Err(RenderError::invalid_request("Invalid pixel bounding box."));
+    }
+    let corners = [
+        (bounds.left, bounds.bottom),
+        (bounds.left, bounds.top),
+        (bounds.right, bounds.bottom),
+        (bounds.right, bounds.top),
+    ];
+    let points = corners.map(|(x, y)| {
+        (
+            (d * (x - e) - c * (y - f)) / determinant,
+            (-b * (x - e) + a * (y - f)) / determinant,
+        )
+    });
+    Ok(BoundingBox {
+        left: points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+        bottom: points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+        right: points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+        top: points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,16 +302,31 @@ impl RenderDocument {
             ))
         })?;
 
-        let pixmap = render(
+        let mut pdf_to_pixel = page.initial_transform(true).as_coeffs();
+        for coefficient in &mut pdf_to_pixel {
+            *coefficient *= f64::from(scale);
+        }
+
+        // hayro's scale-only helper truncates fractional dimensions. Keep the
+        // preflight's rounded-up viewport so allocation and PNG dimensions agree.
+        let mut context = RenderContext::new(viewport_width, viewport_height);
+        let transform = hayro::kurbo::Affine::new(pdf_to_pixel);
+        render_into(
             page,
             &RenderCache::new(),
             &InterpreterSettings::default(),
-            &RenderSettings {
-                x_scale: scale,
-                y_scale: scale,
-                width: Some(viewport_width),
-                height: Some(viewport_height),
-                bg_color: WHITE,
+            &RenderSettings::default(),
+            &mut context,
+            transform,
+        );
+        context.flush();
+        let mut pixmap = Pixmap::new(viewport_width, viewport_height);
+        context.render_with(
+            &mut pixmap,
+            &mut Resources::default(),
+            RasterizerSettings {
+                target_init: TargetInit::Clear(WHITE),
+                ..Default::default()
             },
         );
         let rgba = pixmap.data_as_u8_slice();
@@ -270,10 +336,6 @@ impl RenderDocument {
             ));
         }
         let png = encode_rgba_png_bounded(rgba, width, height, max_output_bytes)?;
-        let mut pdf_to_pixel = page.initial_transform(true).as_coeffs();
-        for coefficient in &mut pdf_to_pixel {
-            *coefficient *= f64::from(scale);
-        }
 
         Ok(RenderedPage {
             page: page_number,
@@ -720,6 +782,56 @@ mod tests {
     use super::*;
     use hayro::hayro_interpret::hayro_syntax::DecryptionError;
 
+    #[test]
+    fn cite_check_inverse_matches_real_rotated_cropbox_render() {
+        for rotation in [0, 90, 180, 270] {
+            let rendered = render_pdf_page(
+                fixture_pdf_with_crop_box(rotation, Some("50 60 170 140")),
+                1,
+                2.0,
+                DEFAULT_MAX_RENDER_PIXELS,
+            )
+            .unwrap();
+            let bounds = BoundingBox {
+                left: 70.,
+                bottom: 75.,
+                right: 100.,
+                top: 95.,
+            };
+            let matrix = rendered.pdf_to_pixel_transform();
+            let corners = [
+                (bounds.left, bounds.bottom),
+                (bounds.left, bounds.top),
+                (bounds.right, bounds.bottom),
+                (bounds.right, bounds.top),
+            ]
+            .map(|(x, y)| apply_transform(matrix, x, y));
+            let pixels = BoundingBox {
+                left: corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                bottom: corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                right: corners
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f64::NEG_INFINITY, f64::max),
+                top: corners
+                    .iter()
+                    .map(|p| p.1)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            };
+            assert_eq!(pdf_box_from_pixel_box(matrix, pixels).unwrap(), bounds);
+        }
+        assert!(pdf_box_from_pixel_box(
+            [0.; 6],
+            BoundingBox {
+                left: 0.,
+                bottom: 0.,
+                right: 1.,
+                top: 1.
+            }
+        )
+        .is_err());
+    }
+
     fn fixture_pdf(rotation: i32) -> Vec<u8> {
         fixture_pdf_with_crop_box(rotation, None)
     }
@@ -765,6 +877,29 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    #[test]
+    fn fractional_page_dimensions_keep_the_planned_white_viewport() {
+        let bytes = fixture_pdf_with_crop_box(0, Some("0 0 120.25 80.25"));
+        let document = RenderDocument::new(bytes).unwrap();
+        let planned = document.planned_render_pixel_count(1, 1.01).unwrap();
+        assert_eq!(planned, 122 * 82);
+        let rendered = document
+            .render_page(1, 1.01, planned, DEFAULT_MAX_RENDER_OUTPUT_BYTES)
+            .unwrap();
+        assert_eq!((rendered.width, rendered.height), (122, 82));
+        assert_eq!(rendered.pixel_count, planned);
+        let image = image::load_from_memory(&rendered.png).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (122, 82));
+        assert_eq!(image.get_pixel(121, 81).0, [255, 255, 255, 255]);
+        assert_eq!(
+            document
+                .render_page(1, 1.01, planned - 1, DEFAULT_MAX_RENDER_OUTPUT_BYTES)
+                .unwrap_err()
+                .code,
+            RenderErrorCode::LimitExceeded
+        );
     }
 
     #[test]

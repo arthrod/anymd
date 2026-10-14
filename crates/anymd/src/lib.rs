@@ -1,3 +1,4 @@
+pub mod cite_check;
 pub mod cli;
 mod command_provider;
 pub mod discover_compat;
@@ -6,17 +7,21 @@ pub mod evidence;
 pub mod http_transport;
 pub mod lean;
 mod ocr_evidence;
+pub mod ocr_vlm;
+pub mod outline;
 mod page_selection;
 pub mod pdf_compare;
 pub mod pdf_evidence;
+pub mod pro;
 pub mod read_pdf;
 mod region_analysis_evidence;
 pub mod schema;
 pub mod search;
 pub mod setup;
 pub mod source_access;
-pub mod star_hint;
 pub mod tool_routes;
+pub mod video_evidence;
+pub mod video_request;
 mod visual_evidence;
 
 use rmcp::{
@@ -33,8 +38,8 @@ use rmcp::{
 };
 
 use crate::schema::{
-    ComparePdfArgs, InspectArgs, InspectOperation, PdfEvidenceArgs, PdfEvidenceOperation, ReadArgs,
-    ReadPdfArgs, SearchArgs, SearchPdfArgs,
+    ComparePdfArgs, InspectArgs, InspectOperation, OutlineArgs, PdfEvidenceArgs,
+    PdfEvidenceOperation, ReadArgs, ReadPdfArgs, SearchArgs, SearchPdfArgs,
 };
 use crate::source_access::SourceAccessPolicy;
 use serde_json::Value;
@@ -42,11 +47,14 @@ use serde_json::Value;
 pub const SERVER_NAME: &str = "anymd";
 /// The product version: the workspace version, set with `bun scripts/set-version.ts`.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// GitHub release assets, `<base>/v<version>/<asset>`: the VLM OCR companion
+/// and its checksum manifest.
+pub const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/SylphxAI/anymd/releases/download";
 pub const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 pub const SERVER_INSTRUCTIONS: &str =
     "Local document reader for agents. read turns any file, URL, or directory listing into clean \
 Markdown (PDF, Office, EPUB, HTML, CSV, images, media) with page/slide/sheet markers and a cursor \
-for long documents. search finds text across files and directories with page locators. inspect \
+for long documents. outline returns a document tree; read node fetches a section. search finds text across files and directories with page locators and node title paths. inspect \
 renders, crops, OCRs, diffs, or returns structured JSON for PDFs. No cloud API key is required.";
 
 fn omit_absent_optional_fields(value: Value) -> Value {
@@ -133,9 +141,24 @@ fn sanitized_tools(router: &ToolRouter<PdfReaderMcp>) -> Vec<rmcp::model::Tool> 
 pub struct PdfReaderMcp {
     pub tool_router: ToolRouter<Self>,
     source_access: SourceAccessPolicy,
+    pro_active: fn() -> bool,
 }
 
 impl PdfReaderMcp {
+    /// Replace the licence check (tests inject a fixed answer).
+    pub fn with_pro_check(mut self, pro_active: fn() -> bool) -> Self {
+        self.pro_active = pro_active;
+        self
+    }
+
+    /// Gate for Pro-only operations: `Some(result)` is the normal tool result
+    /// that carries the ProRequired message; nothing has been opened or run.
+    fn pro_gate(&self, feature: &str) -> Option<rmcp::model::CallToolResult> {
+        pro::require_pro_with(feature, (self.pro_active)())
+            .err()
+            .map(|required| pro::required_result(&required))
+    }
+
     pub fn new() -> Self {
         Self::with_source_access(SourceAccessPolicy::unrestricted())
     }
@@ -144,6 +167,7 @@ impl PdfReaderMcp {
         Self {
             tool_router: Self::tool_router(),
             source_access,
+            pro_active: || pro::current_license().is_some(),
         }
     }
 }
@@ -180,10 +204,17 @@ impl PdfReaderMcp {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         args.validate()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
+        if args.timeline.is_some() {
+            if let Some(result) = self.pro_gate("Video timeline") {
+                return Ok(result);
+            }
+        }
         let policy = self.source_access.clone();
         tokio::task::spawn_blocking(move || lean::read(&args, &policy))
             .await
-            .map_err(|error| ErrorData::internal_error(format!("read worker failed: {error}"), None))?
+            .map_err(|error| {
+                ErrorData::internal_error(format!("read worker failed: {error}"), None)
+            })?
     }
 
     #[tool(
@@ -198,11 +229,33 @@ impl PdfReaderMcp {
         let policy = self.source_access.clone();
         tokio::task::spawn_blocking(move || lean::search(&args, &policy))
             .await
-            .map_err(|error| ErrorData::internal_error(format!("search worker failed: {error}"), None))?
+            .map_err(|error| {
+                ErrorData::internal_error(format!("search worker failed: {error}"), None)
+            })?
     }
 
     #[tool(
-        description = "Deep PDF inspection when Markdown is not enough. operation: inspect (page facts, metadata), render_page (PNG images), extract_regions (crop bounding boxes), ocr_pages / analyze_regions (configured OCR or vision provider), structure (JSON with document map, elements, geometry; profile quality|research adds trust and accessibility reports), compare (page-level diff of sources[0] vs sources[1])."
+        description = "Return a document heading tree with stable node ids, title paths, page/slide/chapter ranges and Markdown byte ranges. PDF bookmarks or detected headings, Word headings, PowerPoint slides, EPUB chapters and headings, HTML and Markdown. format json (default) or tree. Pass a node id to read to fetch that section."
+    )]
+    pub async fn outline(
+        &self,
+        Parameters(args): Parameters<OutlineArgs>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        if args.timeline.is_some() {
+            if let Some(result) = self.pro_gate("Video timeline") {
+                return Ok(result);
+            }
+        }
+        let policy = self.source_access.clone();
+        tokio::task::spawn_blocking(move || outline::tool(&args, &policy))
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("outline worker failed: {error}"), None)
+            })?
+    }
+
+    #[tool(
+        description = "Document and media evidence when Markdown is not enough. video_timeline (bounded scene/cue timeline) and render_frame (actual decoded frames), and cite_check (quote/location support, not semantic truth), are anymd Pro; PDF operations: inspect (page facts, metadata), render_page (PNG images), extract_regions (crop bounding boxes), ocr_pages / analyze_regions (configured OCR or vision provider), structure (JSON with document map, elements, geometry; profile quality|research adds trust and accessibility reports), compare (page-level diff of sources[0] vs sources[1])."
     )]
     pub async fn inspect(
         &self,
@@ -254,7 +307,8 @@ impl PdfReaderMcp {
         &self,
         Parameters(args): Parameters<ComparePdfArgs>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        args.validate().map_err(|message| ErrorData::invalid_params(message, None))?;
+        args.validate()
+            .map_err(|message| ErrorData::invalid_params(message, None))?;
         let value = serde_json::to_value(args).map_err(|error| {
             ErrorData::invalid_params(format!("Failed to encode pdf_compare args: {error}"), None)
         })?;
@@ -340,13 +394,53 @@ fn legacy_args<T: serde::de::DeserializeOwned>(
 ) -> Result<T, ErrorData> {
     let value = Value::Object(request.arguments.clone().unwrap_or_default());
     serde_json::from_value(value).map_err(|error| {
-        ErrorData::invalid_params(format!("Invalid arguments for {}: {error}", request.name), None)
+        ErrorData::invalid_params(
+            format!("Invalid arguments for {}: {error}", request.name),
+            None,
+        )
     })
 }
 
 impl PdfReaderMcp {
-    async fn run_inspect(&self, args: InspectArgs) -> Result<rmcp::model::CallToolResult, ErrorData> {
+    async fn run_inspect(
+        &self,
+        args: InspectArgs,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let pro_feature = match args.operation {
+            InspectOperation::VideoTimeline => Some("Video timeline"),
+            InspectOperation::RenderFrame => Some("Video frame rendering"),
+            InspectOperation::CiteCheck => Some("Cite-check"),
+            _ => None,
+        };
+        if let Some(result) = pro_feature.and_then(|feature| self.pro_gate(feature)) {
+            return Ok(result);
+        }
+        if matches!(
+            args.operation,
+            InspectOperation::VideoTimeline | InspectOperation::RenderFrame
+        ) {
+            let policy = self.source_access.clone();
+            return tokio::task::spawn_blocking(move || {
+                crate::video_request::inspect(args, &policy)
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        }
+        if args.timeline.is_some()
+            || args.timestamps_ms.is_some()
+            || (args.expected_source_sha256.is_some()
+                && !matches!(args.operation, InspectOperation::CiteCheck))
+            || args.transcript.is_some()
+        {
+            return Err(ErrorData::invalid_params(
+                "video options require a video operation",
+                None,
+            ));
+        }
         match args.operation {
+            InspectOperation::CiteCheck => {
+                crate::cite_check::inspect(args, self.source_access.clone()).await
+            }
             InspectOperation::Compare => {
                 let paths: Vec<String> = args
                     .sources
@@ -383,7 +477,11 @@ impl PdfReaderMcp {
                         None,
                     ));
                 }
-                let sources: Vec<_> = args.sources.iter().map(|source| source.as_pdf_source()).collect();
+                let sources: Vec<_> = args
+                    .sources
+                    .iter()
+                    .map(|source| source.as_pdf_source())
+                    .collect();
                 let mut result = self
                     .read_pdf(Parameters(ReadPdfArgs {
                         sources: sources.clone(),
@@ -408,7 +506,11 @@ impl PdfReaderMcp {
                     InspectOperation::ExtractRegions => PdfEvidenceOperation::ExtractRegions,
                     InspectOperation::OcrPages => PdfEvidenceOperation::OcrPages,
                     InspectOperation::AnalyzeRegions => PdfEvidenceOperation::AnalyzeRegions,
-                    InspectOperation::Structure | InspectOperation::Compare => unreachable!(),
+                    InspectOperation::CiteCheck
+                    | InspectOperation::Structure
+                    | InspectOperation::Compare
+                    | InspectOperation::VideoTimeline
+                    | InspectOperation::RenderFrame => unreachable!(),
                 };
                 self.pdf_evidence(Parameters(PdfEvidenceArgs {
                     operation,
@@ -423,6 +525,7 @@ impl PdfReaderMcp {
                     timeout_ms: args.timeout_ms,
                     max_output_chars: args.max_output_chars,
                     languages: args.languages,
+                    ocr: args.ocr,
                 }))
                 .await
             }
@@ -531,19 +634,151 @@ impl ServerHandler for PdfReaderMcp {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_standard_schema_format, sanitize_schema_formats, sanitized_tools, PdfReaderMcp};
+    use super::{
+        is_standard_schema_format, sanitize_schema_formats, sanitized_tools, PdfReaderMcp,
+    };
     use rmcp::handler::server::wrapper::Parameters;
     use serde_json::Value;
     use std::path::PathBuf;
 
+    fn locked() -> PdfReaderMcp {
+        PdfReaderMcp::new().with_pro_check(|| false)
+    }
+
+    fn unlocked() -> PdfReaderMcp {
+        PdfReaderMcp::new().with_pro_check(|| true)
+    }
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        serde_json::to_string(&result.content).expect("content serializes")
+    }
+
+    const MISSING: &str = "/nonexistent/anymd-pro-gate-probe";
+
+    fn inspect_args(operation: &str, extra: Value) -> crate::schema::InspectArgs {
+        let mut value = serde_json::json!({
+            "operation": operation,
+            "sources": [{"path": MISSING}],
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).expect("valid inspect args")
+    }
+
+    #[tokio::test]
+    async fn pro_operations_without_a_licence_return_the_message_and_do_no_work() {
+        let video = serde_json::json!({"timeline": {"end_ms": 1000}, "timestamps_ms": [0]});
+        let cite = serde_json::json!({
+            "citations": [{"quote": "a", "page": 1, "bounding_box": {"left": 0, "bottom": 0, "right": 1, "top": 1}}]
+        });
+        for (operation, feature, extra) in [
+            ("video_timeline", "Video timeline", video.clone()),
+            ("render_frame", "Video frame rendering", video),
+            ("cite_check", "Cite-check", cite),
+        ] {
+            let result = locked()
+                .inspect(Parameters(inspect_args(operation, extra)))
+                .await
+                .expect("an unlicensed Pro call is a normal result, not a protocol error");
+            assert_ne!(result.is_error, Some(true), "{operation}");
+            assert_eq!(
+                result_text(&result),
+                format!(
+                    "[{{\"type\":\"text\",\"text\":\"{feature} is part of anymd Pro: US$29 once for an offline licence. Buy it with `anymd pro buy`. Learn more: https://sylphxai.github.io/anymd/pro\"}}]"
+                ),
+                "{operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_option_on_read_and_outline_is_gated_without_a_licence() {
+        let read: crate::schema::ReadArgs = serde_json::from_value(
+            serde_json::json!({"source": MISSING, "timeline": {"end_ms": 1000}}),
+        )
+        .expect("valid read args");
+        let result = locked()
+            .read(Parameters(read))
+            .await
+            .expect("normal result");
+        assert_ne!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("is part of anymd Pro"));
+        let outline: crate::schema::OutlineArgs = serde_json::from_value(
+            serde_json::json!({"source": MISSING, "timeline": {"end_ms": 1000}}),
+        )
+        .expect("valid outline args");
+        let result = locked()
+            .outline(Parameters(outline))
+            .await
+            .expect("normal result");
+        assert!(result_text(&result).contains("is part of anymd Pro"));
+    }
+
+    #[tokio::test]
+    async fn licensed_pro_operations_proceed_past_the_gate() {
+        let cite = serde_json::json!({
+            "citations": [{"quote": "a", "page": 1, "bounding_box": {"left": 0, "bottom": 0, "right": 1, "top": 1}}]
+        });
+        let video = serde_json::json!({"timeline": {"end_ms": 1000}, "timestamps_ms": [0]});
+        for (operation, extra) in [("cite_check", cite), ("video_timeline", video)] {
+            let outcome = unlocked()
+                .inspect(Parameters(inspect_args(operation, extra)))
+                .await;
+            let text = match &outcome {
+                Ok(result) => result_text(result),
+                Err(error) => error.message.to_string(),
+            };
+            assert!(
+                !text.contains("is part of anymd Pro"),
+                "{operation}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn free_operations_never_hit_the_pro_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Title\n\nhello world\n").expect("write");
+        let server = locked();
+        let read: crate::schema::ReadArgs =
+            serde_json::from_value(serde_json::json!({"source": path})).unwrap();
+        let read = server.read(Parameters(read)).await.expect("read");
+        assert!(result_text(&read).contains("hello world"));
+        let outline: crate::schema::OutlineArgs =
+            serde_json::from_value(serde_json::json!({"source": path})).unwrap();
+        let outline = server.outline(Parameters(outline)).await.expect("outline");
+        assert!(result_text(&outline).contains("Title"));
+        let search: crate::schema::SearchArgs =
+            serde_json::from_value(serde_json::json!({"query": "hello", "sources": [path]}))
+                .unwrap();
+        let search = server.search(Parameters(search)).await.expect("search");
+        assert!(!result_text(&search).contains("is part of anymd Pro"));
+        for operation in ["inspect", "structure", "render_page"] {
+            let outcome = server
+                .inspect(Parameters(inspect_args(operation, serde_json::json!({}))))
+                .await;
+            let text = match &outcome {
+                Ok(result) => result_text(result),
+                Err(error) => error.message.to_string(),
+            };
+            assert!(!text.contains("is part of anymd Pro"), "{operation}");
+        }
+    }
+
     #[test]
-    fn exposes_three_obvious_tools_and_keeps_legacy_names_callable() {
+    fn exposes_four_obvious_tools_and_keeps_legacy_names_callable() {
         let tools = PdfReaderMcp::new().tool_router.list_all();
         let mut names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
         names.sort();
-        assert_eq!(names, ["inspect", "read", "search"]);
+        assert_eq!(names, ["inspect", "outline", "read", "search"]);
         for legacy in super::LEGACY_TOOL_NAMES {
-            assert!(!names.contains(&legacy.to_string()), "{legacy} must not be listed");
+            assert!(
+                !names.contains(&legacy.to_string()),
+                "{legacy} must not be listed"
+            );
         }
     }
 
@@ -563,13 +798,131 @@ mod tests {
                 .and_then(|v| v.as_object())
                 .expect("properties object");
             let required: &[&str] = match tool.name.as_ref() {
-                "read" => &["source", "pages", "max_tokens", "cursor"],
+                "read" => &["source", "pages", "max_tokens", "cursor", "node"],
+                "outline" => &["source", "format"],
                 "search" => &["query", "sources", "mode"],
                 "inspect" => &["operation", "sources"],
                 other => panic!("unexpected tool {other}"),
             };
             for key in required {
-                assert!(props.contains_key(*key), "tool {} must document {key}", tool.name);
+                assert!(
+                    props.contains_key(*key),
+                    "tool {} must document {key}",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    // A strict client checks key presence before tools/call. Nullable values
+    // alone do not allow omission: required must agree with serde's decoder.
+    #[test]
+    fn tools_list_required_matches_argument_omission_for_every_tool() {
+        for tool in sanitized_tools(&PdfReaderMcp::new().tool_router) {
+            let schema = serde_json::to_value(&tool.input_schema).expect("schema json");
+            let (minimal, expected_required) = match tool.name.as_ref() {
+                "read" | "outline" => (serde_json::json!({"source": "report.pdf"}), vec!["source"]),
+                "search" => (serde_json::json!({"query": "needle"}), vec!["query"]),
+                "inspect" => (
+                    serde_json::json!({"operation": "inspect", "sources": [{"path": "report.pdf"}]}),
+                    vec!["operation", "sources"],
+                ),
+                other => panic!("add an omission contract for tool {other}"),
+            };
+            let mut required: Vec<_> = schema["required"]
+                .as_array()
+                .expect("required keys")
+                .iter()
+                .map(|key| key.as_str().expect("required key string"))
+                .collect();
+            required.sort_unstable();
+            assert_eq!(
+                required, expected_required,
+                "tool {} required keys",
+                tool.name
+            );
+            assert!(tool_arguments_decode(&tool.name, minimal.clone()));
+
+            for key in schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+            {
+                let mut omitted = minimal.clone();
+                omitted
+                    .as_object_mut()
+                    .expect("arguments object")
+                    .remove(key);
+                let strict_client_accepts = required.iter().all(|key| omitted.get(*key).is_some());
+                assert_eq!(
+                    strict_client_accepts,
+                    tool_arguments_decode(&tool.name, omitted),
+                    "tool {} disagrees with strict client when {key} is omitted",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    fn tool_arguments_decode(name: &str, value: Value) -> bool {
+        match name {
+            "read" => serde_json::from_value::<crate::schema::ReadArgs>(value).is_ok(),
+            "search" => serde_json::from_value::<crate::schema::SearchArgs>(value).is_ok(),
+            "outline" => serde_json::from_value::<crate::schema::OutlineArgs>(value).is_ok(),
+            "inspect" => serde_json::from_value::<crate::schema::InspectArgs>(value).is_ok(),
+            other => panic!("unknown tool {other}"),
+        }
+    }
+
+    #[test]
+    fn tools_list_optional_overrides_keep_types_enums_and_bounds() {
+        for tool in sanitized_tools(&PdfReaderMcp::new().tool_router) {
+            let schema = serde_json::to_value(&tool.input_schema).expect("schema json");
+            let properties = &schema["properties"];
+            match tool.name.as_ref() {
+                "read" => {
+                    for key in ["transcript", "download_asr_model"] {
+                        assert_eq!(
+                            properties[key]["type"],
+                            serde_json::json!(["boolean", "null"])
+                        );
+                    }
+                    assert_eq!(
+                        properties["images"]["type"],
+                        serde_json::json!(["string", "null"])
+                    );
+                    assert_eq!(
+                        properties["images"]["enum"],
+                        serde_json::json!(["refs", "none", null])
+                    );
+                    assert_eq!(
+                        properties["revisions"]["type"],
+                        serde_json::json!(["string", "null"])
+                    );
+                    assert_eq!(
+                        properties["revisions"]["enum"],
+                        serde_json::json!(["markup", "accept", "reject", null])
+                    );
+                    assert_eq!(properties["source"]["minLength"], 1);
+                    assert_eq!(properties["max_tokens"]["minimum"], 500);
+                }
+                "search" => {
+                    for key in ["case_sensitive", "whole_word"] {
+                        assert_eq!(
+                            properties[key]["type"],
+                            serde_json::json!(["boolean", "null"])
+                        );
+                    }
+                    assert_eq!(properties["query"]["minLength"], 1);
+                    assert_eq!(properties["max_results"]["minimum"], 1);
+                    assert_eq!(properties["max_results"]["maximum"], 500);
+                }
+                "inspect" => {
+                    assert_eq!(properties["scale"]["minimum"], 0.25);
+                    assert_eq!(properties["scale"]["maximum"], 4.0);
+                }
+                "outline" => {}
+                other => panic!("unknown tool {other}"),
             }
         }
     }
@@ -810,7 +1163,10 @@ mod tests {
             .read_pdf(Parameters(read))
             .await
             .expect("read_pdf must complete on an inline-image PDF");
-        assert!(!result.content.is_empty(), "expected a structured read_pdf result");
+        assert!(
+            !result.content.is_empty(),
+            "expected a structured read_pdf result"
+        );
     }
 
     #[tokio::test]

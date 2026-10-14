@@ -39,7 +39,7 @@ def metadata(version: str) -> str:
         + f"Version: {version}\n"
         + "Summary: Any file to clean Markdown for AI agents: PDF, Word, PowerPoint, Excel, EPUB, HTML, images (OCR), audio and video. A fast Rust CLI and MCP server.\n"
         + "Keywords: markdown,pdf,mcp,model-context-protocol,document-conversion,ai-agents\n"
-        + "Author-email: Sylphx <contact@sylphx.com>\n"
+        + "Author-email: Sylphx <hi@sylphx.com>\n"
         + "License-Expression: MIT\n"
         + "License-File: LICENSE\n"
         + "Project-URL: Homepage, https://sylphxai.github.io/anymd/\n"
@@ -48,6 +48,10 @@ def metadata(version: str) -> str:
         + "Classifier: Programming Language :: Rust\n"
         + "Classifier: Topic :: Text Processing :: Markup :: Markdown\n"
         + "Requires-Python: >=3.8\n"
+        + "Provides-Extra: langchain\n"
+        + 'Requires-Dist: langchain-core>=0.3,<2; extra == "langchain"\n'
+        + "Provides-Extra: llamaindex\n"
+        + 'Requires-Dist: llama-index-core>=0.12,<1; extra == "llamaindex"\n'
         + "Description-Content-Type: text/markdown\n\n"
         + readme
     )
@@ -69,6 +73,10 @@ def build(version: str, tag: str, binary: Path, out: Path) -> Path:
         ),
         (f"{dist_info}/licenses/LICENSE", (ROOT / "LICENSE").read_bytes(), 0o644),
     ]
+    # The same platform wheel carries both the CLI and its thin Python API.
+    for source in sorted((PYPI / NAME).rglob("*.py")):
+        files.append((source.relative_to(PYPI).as_posix(), source.read_bytes(), 0o644))
+    files.append((f"{NAME}/py.typed", b"", 0o644))
     files = [(n, d if isinstance(d, bytes) else d.encode(), m) for n, d, m in files]
     record = "".join(f"{n},{digest(d)},{len(d)}\n" for n, d, _ in files) + f"{dist_info}/RECORD,,\n"
     files.append((f"{dist_info}/RECORD", record.encode(), 0o644))

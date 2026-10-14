@@ -1,3 +1,7 @@
+---
+description: "Convert files to Markdown and search folders from the terminal with the anymd CLI."
+---
+
 # CLI
 
 The same binary is a command-line converter, like MarkItDown but much faster. Install it with `npm install -g @sylphx/anymd`, or run it once with `npx -y @sylphx/anymd <file>`. From Python, `uvx anymd <file>` or `pip install anymd`; with Docker, `docker run --rm -v "$PWD:/data" ghcr.io/sylphxai/anymd <file>`.
@@ -12,15 +16,33 @@ anymd search "indemnification" contracts/ --glob '*.pdf'
 anymd doctor                                 # lists the optional tools anymd found
 ```
 
+## Document navigation
+
+```bash
+anymd outline report.pdf                     # indented tree
+anymd outline report.pdf --format json       # preorder nodes with byte ranges
+anymd report.pdf --node n1.2                  # section and its children
+anymd report.pdf --node n1.2 --cursor 4:1200  # continue within that section
+```
+
+Outline and node reads default to no OCR or embedded image export, with Word
+revision markup. `--ocr`, `--images` and `--revisions` select other options; pass
+the same options to outline and node read.
+
+See [outline](./tools#outline) for range and stable-id semantics. Search hits carry
+node ids and title paths. With no `--node`, conversion and paging stay unchanged.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `anymd <file\|url\|dir>... [options]` | Convert to Markdown on stdout |
 | `anymd - [options]` | Convert stdin (the format is detected from the bytes) |
+| `anymd outline <file\|url> [--format tree\|json]` | Show the document tree (tree by default; `--json` also selects JSON) |
 | `anymd search <query> [path\|url...]` | Search files and directories (default: `.`) |
 | `anymd mcp [--allow-dir=<path>]...` | Run the MCP server on stdio |
 | `anymd setup [--dry-run] [--remove]` | Add anymd to the MCP clients on this machine; `--remove` undoes it |
+| `anymd setup ocr` | Download and SHA-256-verify the doc-VLM OCR engine and its weights (~2 GB); opts into CPU inference |
 | `anymd doctor` | Print the version and which optional tools were found |
 | `anymd version` | Print the version |
 
@@ -30,15 +52,16 @@ With no file arguments and a piped stdin (which is how MCP clients launch it), `
 
 | Option | Description |
 |---|---|
+| `--node <id>` | Read the section from `outline`; repeat it with `--cursor` to continue |
 | `-p, --pages <spec>` | Pages, slides, sheets, or chapters, e.g. `1-5,8` |
 | `-o, --output <file>` | Write to a file instead of stdout |
 | `--max-tokens <n>` | Stop at a token budget and print a cursor. The CLI has no budget unless you set one. |
 | `--cursor <cursor>` | Continue from a cursor |
-| `--ocr` / `--no-ocr` | Force or disable OCR (default: automatic when tesseract is installed) |
+| `--ocr [auto\|vlm\|tesseract]` / `--no-ocr` | Select local OCR or disable it. Plain `--ocr` remains automatic. |
 | `--revisions <markup\|accept\|reject>` | Word tracked changes and comments: `markup` (default) writes them as CriticMarkup; `accept` or `reject` gives the text with every change accepted or rejected, without comments (see [Word](formats.md#word)) |
 | `--images <refs\|none>` | `refs` (default) saves images embedded in PDF, DOCX, PPTX and EPUB files to the anymd cache and marks them in the Markdown; `none` leaves them out (see [Embedded images](formats.md#embedded-images)) |
-| `--transcript` | Transcribe audio/video with a local whisper.cpp |
-| `--download-whisper-model` | Download the ggml whisper model on first use (implies `--transcript`; see [Transcripts](formats.md#transcripts)) |
+| `--transcript` | Transcribe audio/video with bundled Qwen3-ASR |
+| `--download-asr-model` | Download pinned Qwen3-ASR weights on first use (presence switch, rejects `=true`/`=false`; implies `--transcript`; see [Transcripts](formats.md#transcripts)) |
 | `--front-matter` | Print the source/title/pages header (always on for several inputs) |
 
 ## Search options
@@ -69,7 +92,7 @@ With no file arguments and a piped stdin (which is how MCP clients launch it), `
 
 ## Star reminder
 
-After the fifth successful interactive run, anymd prints one line to stderr asking for a GitHub star, then never again. The run counter is the `star-hint` file in anymd's cache directory (`$ANYMD_CACHE_DIR`, else the platform cache directory). It stays silent in MCP server mode, when stderr is not a terminal, and when `CI` is set. Set `ANYMD_NO_STAR_HINT=1` to turn it off.
+After the fifth successful interactive run, anymd prints one line to stderr asking for a GitHub star, then never again. The run counter is the `star-hint` file in anymd's cache directory (`$ANYMD_CACHE_DIR`, else the platform cache directory). It stays silent in MCP server mode, when stderr is not a terminal, and when `CI` is set. Set `ANYMD_NO_STAR_HINT=1` to turn it off. The hint and cache-root selection come from `sylphx-mcp-kit` 0.3; anymd keeps its existing cache paths and image/model retention.
 
 ## Examples
 
@@ -91,3 +114,15 @@ Ranked search when you do not know the exact wording:
 ```bash
 anymd search "how is attention scaled" papers/ --mode ranked --max 5
 ```
+
+## Local document OCR
+
+`anymd setup ocr` downloads the OCR engine (the small `anymd-ocr-vlm` executable from this version's GitHub release, checked against the release's `anymd-ocr-vlm-SHA256SUMS`, which must carry a valid signature from a key built into anymd for exactly this version) and PaddleOCR-VL-1.6 and PP-DocLayoutV3 into the anymd cache (`ANYMD_CACHE_DIR`, otherwise the platform cache directory). Every file has a pinned revision, SHA-256 and size. The weights never download under automatic OCR or during conversion; only the engine refresh below may. The setup command is an explicit opt-in to the slower CPU route. That consent covers refreshing the ~10 MB engine when anymd is upgraded: if the weights are installed but the engine is from another version, anymd fetches the engine for the new version once, and falls back to tesseract with a hint (`run anymd setup ocr`) if that fails. The 2 GB weights are never fetched automatically.
+
+`--ocr vlm` uses installed weights, with Metal on supported Macs and CPU elsewhere. Without the one-time setup, `--ocr vlm` returns a notice naming `anymd setup ocr`, the ~2 GB model download it opts into, and the step to retry with OCR enabled. A first read of a scanned PDF gives the same guidance when neither installed models nor tesseract can read it. Documents stay on your machine; over MCP this is a normal tool result, not an error, and nothing is silently downloaded. The engine runs as the `anymd-ocr-vlm` worker next to the weights, so the default `anymd` binary stays about 25 MB; builds with `--features ocr-vlm` run it in-process. `--ocr auto` uses the installed models, otherwise tesseract and a one-line hint. `--ocr tesseract` keeps the old route. `ANYMD_OCR=auto|vlm|tesseract` sets the default for CLI and MCP; a request option takes precedence. MCP `read` accepts the same strings in `ocr`; existing booleans remain valid. Native PDF text is unchanged: VLM conversion requires painted raster images and no native letters or digits, including rotated text. Even a short native title page stays on the text-layer engine. Image/PDF VLM failures return an error rather than silently substituting tesseract or caching partial OCR.
+
+Table regions become Markdown and formula regions become display LaTeX. OCR evidence keeps pixel boxes internally and reading order; the PDF evidence adapter converts boxes to PDF coordinates. Layout confidence is labelled separately from recognition confidence. MCP `inspect` with `operation: "ocr_pages"` accepts `ocr: "auto"|"vlm"|"tesseract"`; the legacy `pdf_evidence` route accepts it too. A per-call engine overrides the command provider. When there is no per-call engine, `ANYMD_OCR=vlm` selects the built-in provider unless an explicit command provider is configured.
+
+`ANYMD_OCR_TIMEOUT_MS` sets a hard per-page subprocess deadline (default 300000, range 1000–600000). The timeout terminates the worker and releases model memory. `ANYMD_OCR_MAX_TOKENS` caps generated tokens per region (default 4096, range 1–8192). A token-run guard stops generation after at least 32 repeating tokens; completed text is not trimmed for repetition, so legitimate repeated rows keep their following content. Normal image/PDF reads and OCR evidence share the existing process-wide limit of two active OCR requests. A PDF request shares a 600000 ms aggregate deadline across its pages and stops on its first failed page; no later model worker starts. `ANYMD_OCR_QUANTIZATION=q8|q4` selects experimental CPU-only GGML quantization of the decoder linear weights. The default (`none`) uses the pinned safetensors as-is; vision, embeddings and layout remain unquantized.
+
+Linux arm64 doc-VLM inference needs an FP16-capable CPU (ARMv8.2 or newer). Older ARM machines keep the tesseract/native-text routes; explicit VLM requests report the hardware limit. CI checks the plain CLI on an emulated Cortex-A72.

@@ -24,9 +24,10 @@ const CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub struct OpenOptions {
     /// None = OCR image-only pages and images when `tesseract` is installed.
     pub ocr: Option<bool>,
+    pub ocr_engine: Option<crate::ocr_vlm::OcrEngine>,
     pub transcript: bool,
-    /// With `transcript`: fetch the whisper model when none is installed.
-    pub download_whisper_model: bool,
+    /// With `transcript`: fetch the Qwen3-ASR model when none is installed.
+    pub download_asr_model: bool,
     /// Export images embedded in PDF, DOCX, PPTX and EPUB files into this
     /// store and mark them in the Markdown. `None` leaves them out.
     pub images: Option<ImageStore>,
@@ -67,6 +68,10 @@ pub struct Opened {
     pub metadata: Vec<(String, String)>,
     options: OpenOptions,
     body: Body,
+    native_outline: Vec<(usize, String, Option<u32>)>,
+    ocr_request: Mutex<Option<crate::ocr_vlm::OcrRequest>>,
+    /// Pages an OCR engine actually ran on (whether or not it found text).
+    ocr_ran: Mutex<Vec<u32>>,
 }
 
 /// A source spec is a URL when it starts with http:// or https://.
@@ -134,12 +139,17 @@ type CacheKey = (
     u64,
     u128,
     bool,
+    Option<bool>,
+    crate::ocr_vlm::OcrEngine,
+    bool,
+    String,
     Option<PathBuf>,
     anymd_formats::Revisions,
 );
 
 struct CachedDoc {
     format: &'static str,
+    native_outline: Vec<(usize, String, Option<u32>)>,
     title: Option<String>,
     metadata: Vec<(String, String)>,
     units: Arc<Vec<Unit>>,
@@ -173,6 +183,15 @@ fn cache_key(path: &Path, ocr: bool, options: &OpenOptions) -> Option<CacheKey> 
         meta.len(),
         modified,
         ocr,
+        options.ocr,
+        options.ocr_engine.unwrap_or_default(),
+        crate::ocr_vlm::root().is_ok_and(|p| crate::ocr_vlm::ready_at(&p)),
+        format!(
+            "{:?}|{:?}|{:?}",
+            crate::ocr_vlm::root(),
+            std::env::var("ANYMD_OCR_QUANTIZATION").ok(),
+            std::env::var("ANYMD_OCR_MAX_TOKENS").ok()
+        ),
         options.images.as_ref().map(|s| s.dir().to_path_buf()),
         options.revisions,
     ))
@@ -241,6 +260,34 @@ fn cache_put(key: CacheKey, doc: Arc<CachedDoc>) {
 // ---------------------------------------------------------------------------
 
 impl Opened {
+    pub(crate) fn from_video(label: &str, evidence: &crate::video_evidence::VideoEvidence) -> Self {
+        let units = crate::video_evidence::sections(evidence)
+            .into_iter()
+            .enumerate()
+            .map(|(index, section)| Unit {
+                number: index as u32 + 1,
+                label: format!("section {}", index + 1),
+                markdown: format!("# {}\n\n{}", section.label, section.markdown),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            label: label.into(),
+            format: "video",
+            title: None,
+            unit_noun: "section",
+            total: units.len() as u32,
+            metadata: vec![(
+                "source_sha256".into(),
+                evidence.timeline.source_sha256.clone(),
+            )],
+            options: OpenOptions::default(),
+            body: Body::Units(Arc::new(units)),
+            native_outline: vec![],
+            ocr_request: Mutex::new(None),
+            ocr_ran: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Open a local path (admitted by `policy`) or an http(s) URL.
     pub fn open(
         spec: &str,
@@ -270,7 +317,7 @@ impl Opened {
                 &anymd_formats::Options {
                     path: Some(path.clone()),
                     transcript: options.transcript,
-                    download_whisper_model: options.download_whisper_model,
+                    download_asr_model: options.download_asr_model,
                     ..Default::default()
                 },
             )
@@ -304,6 +351,7 @@ impl Opened {
                 key,
                 Arc::new(CachedDoc {
                     format: opened.format,
+                    native_outline: opened.native_outline.clone(),
                     title: opened.title.clone(),
                     metadata: opened.metadata.clone(),
                     units: units.clone(),
@@ -370,6 +418,9 @@ impl Opened {
             total,
             metadata: Vec::new(),
             options: options.clone(),
+            native_outline: Vec::new(),
+            ocr_request: Mutex::new(None),
+            ocr_ran: Mutex::new(Vec::new()),
             body: Body::Pdf {
                 doc: Box::new(doc),
                 bytes,
@@ -405,6 +456,9 @@ impl Opened {
             total: units.len() as u32,
             metadata: converted.metadata,
             options: options.clone(),
+            native_outline: converted.outline,
+            ocr_request: Mutex::new(None),
+            ocr_ran: Mutex::new(Vec::new()),
             body: Body::Units(Arc::new(units)),
         }
     }
@@ -419,6 +473,9 @@ impl Opened {
             total: cached.units.len() as u32,
             metadata: cached.metadata.clone(),
             options: options.clone(),
+            native_outline: cached.native_outline.clone(),
+            ocr_request: Mutex::new(None),
+            ocr_ran: Mutex::new(Vec::new()),
             body: Body::Units(cached.units.clone()),
         }
     }
@@ -432,8 +489,19 @@ impl Opened {
     pub fn outline(&self) -> Vec<(usize, String, Option<u32>)> {
         match &self.body {
             Body::Pdf { doc, .. } => markdown_layout::outline(doc),
-            Body::Units(_) => Vec::new(),
+            Body::Units(_) => self.native_outline.clone(),
         }
+    }
+
+    pub(crate) fn note_ocr_ran(&self, page: u32) {
+        if let Ok(mut ran) = self.ocr_ran.lock() {
+            ran.push(page);
+        }
+    }
+
+    /// Whether OCR ran on this page (so a blank result means it found no text).
+    pub fn ocr_ran(&self, page: u32) -> bool {
+        self.ocr_ran.lock().is_ok_and(|ran| ran.contains(&page))
     }
 
     /// Convert the requested units (1-based numbers, ascending).
@@ -482,10 +550,27 @@ impl Opened {
                         markdown: page.markdown,
                     })
                     .collect();
-                self.ocr_sparse_pages(&mut units, bytes.as_deref(), path.as_deref());
+                self.ocr_sparse_pages(&mut units, doc, bytes.as_deref(), path.as_deref())?;
                 Ok(units)
             }
         }
+    }
+
+    /// PDF pages among `units` with no text (after any OCR) that are covered by
+    /// images: scans that were not read, as opposed to genuinely empty pages.
+    pub fn scanned_pages(&self, units: &[Unit]) -> Vec<u32> {
+        let Body::Pdf { doc, .. } = &self.body else {
+            return Vec::new();
+        };
+        let blank: Vec<u32> = units
+            .iter()
+            .filter(|unit| !unit.markdown.chars().any(char::is_alphanumeric))
+            .map(|unit| unit.number)
+            .collect();
+        if blank.is_empty() {
+            return Vec::new();
+        }
+        markdown_layout::scanned_pages(doc, &blank)
     }
 
     /// Title from page 1 when the PDF has no usable /Title.
@@ -522,6 +607,7 @@ impl Opened {
                         key,
                         Arc::new(CachedDoc {
                             format: "pdf",
+                            native_outline: Vec::new(),
                             title: self.title.clone(),
                             metadata: Vec::new(),
                             units: units.clone(),
@@ -535,22 +621,38 @@ impl Opened {
         }
     }
 
-    fn ocr_sparse_pages(&self, units: &mut [Unit], bytes: Option<&Vec<u8>>, path: Option<&Path>) {
+    fn ocr_sparse_pages(
+        &self,
+        units: &mut [Unit],
+        doc: &markdown_layout::PdfDocument,
+        bytes: Option<&Vec<u8>>,
+        path: Option<&Path>,
+    ) -> Result<(), String> {
         let wanted = match self.options.ocr {
-            Some(false) => return,
+            Some(false) => return Ok(()),
             Some(true) => true,
             None => false,
         };
-        let sparse: Vec<usize> = units
-            .iter()
-            .enumerate()
-            .filter(|(_, unit)| visible_chars(&unit.markdown) < SPARSE_PAGE_CHARS)
-            .map(|(index, _)| index)
-            .collect();
+        let vlm = crate::ocr_vlm::requested(self.options.ocr_engine.unwrap_or_default());
+        let sparse = ocr_candidates(units, doc, vlm);
         if sparse.is_empty() {
-            return;
+            return Ok(());
         }
-        if !anymd_formats::image::ocr_available() {
+        let mut admission = if vlm {
+            Some(
+                self.ocr_request
+                    .lock()
+                    .map_err(|_| "OCR request state poisoned".to_string())?,
+            )
+        } else {
+            None
+        };
+        if let Some(admission) = admission.as_mut() {
+            if admission.is_none() {
+                **admission = Some(crate::ocr_vlm::OcrRequest::acquire()?);
+            }
+        }
+        if !vlm && !anymd_formats::image::ocr_available() {
             if wanted {
                 for index in sparse {
                     units[index].markdown.push_str(
@@ -558,57 +660,93 @@ impl Opened {
                     );
                 }
             }
-            return;
+            return Ok(());
         }
         let pdf_bytes = match (bytes, path) {
             (Some(bytes), _) => bytes.clone(),
             (None, Some(path)) => match std::fs::read(path) {
                 Ok(bytes) => bytes,
-                Err(_) => return,
+                Err(error) if vlm => return Err(error.to_string()),
+                Err(_) => return Ok(()),
             },
-            (None, None) => return,
+            (None, None) => return Ok(()),
         };
-        let Ok(renderer) = anymd_core::render::RenderDocument::new(pdf_bytes) else {
-            return;
+        let renderer = match anymd_core::render::RenderDocument::new(pdf_bytes) {
+            Ok(renderer) => renderer,
+            Err(error) if vlm => return Err(error.message),
+            Err(_) => return Ok(()),
         };
-        // Render one page at a time, then OCR the pages side by side (one
-        // tesseract thread each).
-        let rendered: Vec<(usize, Result<anymd_core::render::RenderedPage, String>)> = sparse
-            .iter()
-            .map(|&index| {
-                let page = units[index].number as usize;
-                let image = renderer
-                    .render_page(page, OCR_SCALE, OCR_MAX_PIXELS, 256 * 1024 * 1024)
-                    .map_err(|error| error.message);
-                (index, image)
-            })
-            .collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 8);
-        let mut results: Vec<(usize, Result<String, String>)> = Vec::with_capacity(rendered.len());
-        for chunk in rendered.chunks(workers) {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|(index, image)| {
-                        scope.spawn(move || {
-                            let text = image.clone().and_then(|image| ocr_page(&image));
-                            (*index, text)
-                        })
+        let mut results: Vec<(usize, Result<String, String>)> = Vec::with_capacity(sparse.len());
+        if vlm {
+            // The document keeps one shared permit/deadline across lazy unit
+            // reads. Propagate the first failure before rendering another page.
+            let request = admission
+                .as_mut()
+                .and_then(|guard| guard.as_mut())
+                .ok_or("Missing OCR admission")?;
+            for &index in &sparse {
+                let text = request
+                    .run_page(|deadline, permit| {
+                        let page = renderer
+                            .render_page(
+                                units[index].number as usize,
+                                OCR_SCALE,
+                                OCR_MAX_PIXELS,
+                                256 * 1024 * 1024,
+                            )
+                            .map_err(|error| error.message)?;
+                        crate::ocr_vlm::recognize_admitted(&page.png, deadline, permit)
+                            .map(|p| p.markdown())
                     })
-                    .collect();
-                for handle in handles {
-                    if let Ok(result) = handle.join() {
-                        results.push(result);
+                    .map_err(|error| {
+                        format!(
+                            "Doc-VLM OCR failed on page {}: {error}",
+                            units[index].number
+                        )
+                    })?;
+                results.push((index, Ok(text)));
+            }
+        } else {
+            // Render one page at a time, then OCR the pages side by side (one
+            // tesseract thread each).
+            let rendered: Vec<(usize, Result<anymd_core::render::RenderedPage, String>)> = sparse
+                .iter()
+                .map(|&index| {
+                    let page = units[index].number as usize;
+                    let image = renderer
+                        .render_page(page, OCR_SCALE, OCR_MAX_PIXELS, 256 * 1024 * 1024)
+                        .map_err(|error| error.message);
+                    (index, image)
+                })
+                .collect();
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, 8);
+
+            for chunk in rendered.chunks(workers) {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|(index, image)| {
+                            scope.spawn(move || {
+                                let text = image.clone().and_then(|image| ocr_page(&image));
+                                (*index, text)
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        if let Ok(result) = handle.join() {
+                            results.push(result);
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         for (index, text) in results {
             match text {
                 Ok(text) if !text.trim().is_empty() => {
+                    self.note_ocr_ran(units[index].number);
                     let existing = units[index].markdown.trim().to_string();
                     units[index].markdown = if existing.is_empty() {
                         format!("<!-- OCR text -->\n\n{text}")
@@ -616,7 +754,15 @@ impl Opened {
                         format!("{existing}\n\n<!-- OCR text -->\n\n{text}")
                     };
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    self.note_ocr_ran(units[index].number);
+                }
+                Err(error) if vlm => {
+                    return Err(format!(
+                        "Doc-VLM OCR failed on page {}: {error}",
+                        units[index].number
+                    ));
+                }
                 Err(error) => {
                     units[index]
                         .markdown
@@ -624,6 +770,28 @@ impl Opened {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+/// Native raster/text evidence, not emitted Markdown, selects VLM pages.
+fn ocr_candidates(units: &[Unit], doc: &markdown_layout::PdfDocument, vlm: bool) -> Vec<usize> {
+    if vlm {
+        let numbers: Vec<_> = units.iter().map(|unit| unit.number).collect();
+        let image_only = markdown_layout::image_only_pages(doc, &numbers);
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| image_only.contains(&unit.number))
+            .map(|(index, _)| index)
+            .collect()
+    } else {
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| visible_chars(&unit.markdown) < SPARSE_PAGE_CHARS)
+            .map(|(index, _)| index)
+            .collect()
     }
 }
 
@@ -704,19 +872,37 @@ fn convert_other(
         Some(value) => value,
         None => format == Format::Image && anymd_formats::image::ocr_available(),
     };
-    anymd_formats::convert(
+    let vlm = format == Format::Image
+        && options.ocr != Some(false)
+        && crate::ocr_vlm::requested(options.ocr_engine.unwrap_or_default());
+    let mut converted = anymd_formats::convert(
         format,
         bytes,
         &anymd_formats::Options {
             base_url,
-            ocr,
+            ocr: ocr && !vlm,
             transcript: options.transcript,
-            download_whisper_model: options.download_whisper_model,
+            download_asr_model: options.download_asr_model,
             path,
             images: options.images.clone(),
             revisions: options.revisions,
         },
-    )
+    )?;
+    if vlm {
+        let page = crate::ocr_vlm::recognize(bytes).map_err(ConvertError::Unsupported)?;
+        if let Some(section) = converted.sections.first_mut() {
+            if let Some(hint) = section
+                .markdown
+                .find("_Image text is not extracted by default")
+            {
+                section.markdown.truncate(hint);
+            }
+            section
+                .markdown
+                .push_str(&format!("\n\n## Text (OCR)\n\n{}", page.markdown()));
+        }
+    }
+    Ok(converted)
 }
 
 /// Write one PDF image to the store and build its Markdown.
@@ -870,6 +1056,61 @@ pub fn readable_extension(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn margin_scan_candidates_ignore_emitted_image_reference_length() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/scanned-page.pdf");
+        let mut doc = load_document(&fixture).unwrap();
+        let page = doc.get_pages()[&1];
+        let media_box = doc
+            .get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .get_mut(b"MediaBox")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        media_box[2] = 1200.into();
+        media_box[3] = 1600.into();
+        // Enlarging the page puts the painted scan below the 80% whole-page
+        // image threshold; exporting it adds more than 24 visible path chars.
+        let reference = Unit {
+            number: 1,
+            label: "page 1".into(),
+            markdown: "![image](/cache/images/01234567890123456789012345678901234567.png)".into(),
+        };
+        let plain = Unit {
+            markdown: String::new(),
+            ..reference.clone()
+        };
+        assert!(visible_chars(&reference.markdown) > SPARSE_PAGE_CHARS);
+        assert_eq!(ocr_candidates(&[reference.clone()], &doc, true), vec![0]);
+        assert_eq!(ocr_candidates(&[plain], &doc, true), vec![0]);
+        assert!(ocr_candidates(&[reference], &doc, false).is_empty());
+        // Page 2 of the fixture has a native text line over its raster image.
+        let native = Unit {
+            number: 2,
+            label: "page 2".into(),
+            markdown: "Title".into(),
+        };
+        assert!(ocr_candidates(&[native], &doc, true).is_empty());
+    }
+
+    #[test]
+    fn disabled_ocr_has_a_distinct_cache_key_without_tesseract() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let automatic = OpenOptions::default();
+        let disabled = OpenOptions {
+            ocr: Some(false),
+            ..Default::default()
+        };
+        assert_ne!(
+            cache_key(file.path(), false, &automatic),
+            cache_key(file.path(), false, &disabled)
+        );
+    }
 
     #[test]
     fn content_types_map_to_formats() {

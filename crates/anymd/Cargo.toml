@@ -2,14 +2,14 @@
 name = "anymd"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 description = "anymd: any file to clean Markdown for AI agents. Pure-Rust MCP server + CLI binary for @sylphx/anymd"
 homepage.workspace = true
 authors.workspace = true
 readme.workspace = true
-include = ["src/**/*", "Cargo.toml"]
+include = ["src/**/*", "Cargo.toml", "tests/worker_lifecycle.rs", "tests/worker_lifecycle.py"]
 keywords = ["mcp", "pdf", "rmcp", "agent"]
 categories = ["command-line-utilities"]
 
@@ -20,11 +20,26 @@ path = "src/lib.rs"
 name = "anymd"
 path = "src/main.rs"
 
+[[bin]]
+name = "anymd-ocr-vlm"
+path = "src/bin/anymd-ocr-vlm.rs"
+required-features = ["ocr-vlm"]
+
+# The default build leaves the in-process VLM engine (candle, ~6 MB) out; VLM
+# OCR runs in the `anymd-ocr-vlm` companion that `anymd setup ocr` installs.
+# `--features ocr-vlm` builds the engine in, and builds the companion.
+[features]
+default = []
+ocr-vlm = ["anymd-ocr-vlm/candle"]
+
 [dependencies]
+anymd-ocr-vlm = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "tiff", "bmp", "webp"] }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = "3"
 command-group = { version = "5", features = ["with-tokio"] }
 anymd-core = { workspace = true }
 anymd-formats = { workspace = true }
@@ -36,8 +51,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
-# crates.io release of the shared MCP kit (0.2.x only adds the `embed` module to v0.1.1).
-sylphx-mcp-kit = "0.2.3"
+# Shared MCP setup, CLI hints and cache-root policy.
+sylphx-mcp-kit = { version = "0.7.3", features = ["licence"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -47,3 +62,9 @@ ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# Model-free lifecycle regressions run only on isolated CI runners.
+[[test]]
+name = "worker_lifecycle"
+path = "tests/worker_lifecycle.rs"
+harness = false

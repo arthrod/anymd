@@ -1,3 +1,7 @@
+---
+description: "Every format anymd reads: PDF, Word, PowerPoint, Excel, EPUB, HTML, images with OCR, audio and video."
+---
+
 # Formats
 
 One `read` call handles every format below, detected from the file's bytes, not its name. Everything is parsed natively in Rust (zip/XML, calamine, html5ever): no Python, LibreOffice, or cloud service.
@@ -17,7 +21,7 @@ One `read` call handles every format below, detected from the file's bytes, not 
 
 ## PDF
 
-Reading-order Markdown: headings, paragraphs, lists, tables, sub/superscripts, `<!-- page N -->` markers, and bookmarks as an outline. Running headers and page numbers are removed. Image-only pages are OCR'd when `tesseract` is installed: pages are read at 300 dpi, several at a time, and the words tesseract finds are laid out like a text page, so scans get paragraphs and tables too.
+Reading-order Markdown: headings, paragraphs, lists, tables, sub/superscripts, `<!-- page N -->` markers, and bookmarks as an outline. Running headers and page numbers are removed. Image-only pages use [local doc-VLM OCR](./cli#local-document-ocr) after explicit model setup, otherwise installed tesseract. Both read pages at 300 dpi. Doc-VLM uses layout boxes and reading order, with tables as Markdown and formulas as LaTeX; its model workers run one page at a time. Tesseract pages run in parallel and their words are laid out like a text page, so scans get paragraphs and tables too.
 
 How it works: anymd reads glyph positions rather than text runs. Glyphs are grouped into lines by baseline, which tolerates super- and subscripts. Word spaces come from the gaps between glyphs, measured against the font size and adjusted for letter tracking. A column-aware XY cut finds gutters between running text. Tables come from drawn lines where a table has them (a missing line between two cells makes a merged cell) and from aligned columns of whitespace where it does not. Wrapped cell text stays in its cell, stacked header lines become one header, and a header over several columns is kept with each of them. Text a reader cannot see (invisible text, or text in the colour of the box behind it) is left out. Pages are processed in parallel and isolated from each other, so one malformed page never fails the whole document.
 
@@ -95,25 +99,67 @@ Known gap in this version: figures drawn as vector graphics (charts, diagrams ma
 
 ## Images
 
-Dimensions and EXIF (camera, date, GPS), plus OCR text when `tesseract` is installed.
+Dimensions and EXIF (camera, date, GPS), plus local OCR. `anymd setup ocr` explicitly installs the doc-VLM engine and weights; automatic OCR otherwise uses installed tesseract without downloading anything. See [local OCR](./cli#local-document-ocr).
 
 ## Audio and video
 
-Duration, streams, chapters, and embedded and sidecar subtitles (SRT/VTT), via `ffprobe`/`ffmpeg`. With `transcript: true` (CLI: `--transcript`), a local whisper.cpp transcript.
+Duration, streams, chapters, and embedded and sidecar subtitles (SRT/VTT), via `ffprobe`/`ffmpeg`. With `transcript: true` (CLI: `--transcript`), a local Qwen3-ASR transcript.
 
 ### Transcripts
 
-A transcript needs three things on your machine; nothing is uploaded.
+`transcript: true` (CLI: `--transcript`) uses bundled **transcribe-cpp 0.2.4** and
+**Qwen3-ASR-1.7B Q8_0 for every language**, with automatic language detection.
+Whisper is no longer an engine option. Audio and documents stay on your machine.
 
-- **whisper.cpp**: `whisper-cli` (or `whisper-cpp`) on `PATH`, or `ANYMD_WHISPER_BIN` pointing at it. macOS: `brew install whisper-cpp`. Windows: `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases). Linux: build from source (`git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp && cmake -B build && cmake --build build -j --config Release`, then put `build/bin/whisper-cli` on `PATH`), the release tarball, or Homebrew.
-- **ffmpeg**, to extract the audio track.
-- **A ggml model**. `ANYMD_WHISPER_MODEL` wins when set; otherwise anymd uses a `ggml-*.bin` in its cache (`$ANYMD_CACHE_DIR/models`, else `~/.cache/anymd/models`, `~/Library/Caches/anymd/models`, or `%LOCALAPPDATA%\anymd\cache\models`). To fetch one on first use, pass `download_whisper_model: true` (CLI: `--download-whisper-model`, which implies `--transcript`) or set `ANYMD_WHISPER_AUTO_DOWNLOAD=1`. anymd downloads `ggml-base.en.bin` (148 MB) from the official [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) repository, checks its SHA-256, and renames it into place. `ANYMD_WHISPER_MODEL_SIZE` picks `tiny`, `tiny.en`, `base`, `base.en`, `small`, or `small.en`; `ANYMD_WHISPER_MODEL_BASE_URL` points at a mirror (the hash is still checked). Multilingual models detect the spoken language.
+Install **ffmpeg** to extract audio. With `download_asr_model: true` (CLI:
+`--download-asr-model`), anymd fetches
+`Qwen3-ASR-1.7B-Q8_0.gguf` (2.19 GB), checks its exact size and pinned SHA-256,
+and atomically saves it in `$ANYMD_CACHE_DIR/models`, or the platform cache
+(`~/.cache/anymd/models`, `~/Library/Caches/anymd/models`, or
+`%LOCALAPPDATA%\anymd\cache\models`). Later requests verify and reuse it.
+`ANYMD_ASR_MODEL` can point at a preinstalled copy of **the same pinned model**;
+other models and corrupt cached files are rejected, not silently substituted.
+The pinned download revision and checksum are in
+[`asr.rs`](https://github.com/SylphxAI/anymd/blob/main/crates/anymd-formats/src/asr.rs).
+To work offline, install that exact model first. `transcript: true` alone never
+downloads models; missing weights produce an installation hint. No weights are
+fetched for ordinary metadata or subtitle reads.
+
+Long audio is decoded one 20-second chunk at a time, keeping audio memory bounded
+and all timestamps on the original source timeline. The model is loaded once per
+transcript. Segment timestamps mark chunk boundaries; they are not estimated word
+positions. Digitally silent chunks are skipped. An inference error or truncation
+is reported rather than presented as a complete transcript.
+
+For **word timestamps**, an optional [CrispASR 0.8.38](https://github.com/CrispStrobe/CrispASR/releases/tag/v0.8.38)
+`crispasr` binary on PATH (or `ANYMD_ALIGNER_BIN`) runs **standalone alignment only**
+with Qwen3-ForcedAligner-0.6B Q8_0. It does not run ASR or replace transcribe-cpp.
+The aligner weights (986 MB) are also revision/size/SHA-256 pinned and fetched on
+first supported use only when `download_asr_model` is true;
+`ANYMD_ALIGNER_MODEL` accepts a preinstalled pinned copy.
+Supported language codes are en, zh, yue, ja, ko, fr, de, it, pt, ru and es.
+Where that optional runtime is unavailable, the language is unsupported, or
+alignment fails validation, anymd keeps the transcript and labels its timestamps
+as **segment**, not word. Word timings must be monotonic, inside the chunk and
+account for the transcript text. Output explicitly names word, segment or mixed
+granularity and includes millisecond start/end times.
 
 ```bash
-anymd talk.mp4 --download-whisper-model
+anymd talk.mp4 --download-asr-model  # explicitly allow the model download
+anymd talk.mp4 --transcript          # cached/preinstalled models only
 ```
 
-When a piece is missing, the output names it with the install command for your OS instead of failing.
+`download_asr_model: true` / `--download-asr-model` also implies `transcript`.
+Both CLI download flags are presence switches; inline values such as `=false`
+are rejected rather than granting permission. MCP download options are booleans.
+The old `download_whisper_model` / `--download-whisper-model` spelling is accepted
+only as a compatibility alias for Qwen; no Whisper engine or weights remain.
+Old `ANYMD_WHISPER_*` settings are not used.
+
+**Japanese trade-off:** on our 200-utterance FLEURS sample, Qwen trails the
+whisper-turbo benchmark control (5.93 vs 4.80 raw CER; 5.56 vs 4.59 with
+symmetric numeral/kana normalisation). We use one speech model
+for all languages and accept this gap. See [ASR benchmarks](benchmarks.md#speech-to-text).
 
 ## Optional tools
 
@@ -124,7 +170,7 @@ anymd never needs these, but uses them when they are on your `PATH`:
 | `tesseract` | OCR for images and scanned PDF pages |
 | `ffprobe` | Audio/video metadata and chapters |
 | `ffmpeg` | Embedded subtitles and transcript audio |
-| `whisper-cli` (whisper.cpp) | Local transcripts (see [Transcripts](#transcripts)) |
+| `crispasr` (optional, alignment only) | Qwen3-ForcedAligner word timestamps (see [Transcripts](#transcripts)) |
 
 Check what anymd found:
 
@@ -135,8 +181,8 @@ anymd 6.0.0 (native Rust)
   ffprobe      found      audio/video metadata and chapters
   ffmpeg       found      embedded subtitles and transcript audio
 Transcripts (--transcript):
-  whisper.cpp    found      /opt/homebrew/bin/whisper-cli
-  whisper model  not found  cache /Users/me/Library/Caches/anymd/models; `--download-whisper-model` fetches ggml-base.en.bin (148 MB)
+  ASR runtime    transcribe-cpp 0.2.4 (CPU, bundled)
+  ASR model      not installed: Qwen3-ASR-1.7B-Q8_0.gguf (2185 MB, SHA-256 pinned)
 ```
 
-Typical installs: `brew install tesseract ffmpeg whisper-cpp` on macOS, `apt install tesseract-ocr ffmpeg` on Debian/Ubuntu. For other OCR languages, install the tesseract language pack (for example `tesseract-ocr-chi-tra`).
+Typical installs: `brew install tesseract ffmpeg` on macOS, `apt install tesseract-ocr ffmpeg` on Debian/Ubuntu. For other OCR languages, install the tesseract language pack (for example `tesseract-ocr-chi-tra`).

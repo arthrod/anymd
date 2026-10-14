@@ -14,25 +14,33 @@ anymd — any file → clean Markdown for AI agents
 Usage:
   anymd <file|url|dir>... [options]   Convert to Markdown on stdout
   anymd - [options]                   Convert stdin
+  anymd outline <file|url> [--format tree|json]  Show the heading tree
   anymd search <query> [path|url...]  Search files and directories (default: .)
   anymd mcp [--allow-dir=<path>]...   Run the MCP server on stdio
                                       (also the default when stdin is piped and no file is given)
   anymd setup [--dry-run] [--remove]  Add anymd to the MCP clients on this machine
+  anymd pro status | buy | activate <token> Show, buy or activate an anymd Pro licence
                                       (Claude Code, Codex, Cursor, VS Code, Claude Desktop,
                                       Windsurf, Gemini CLI); --remove undoes it
   anymd doctor                        Print version and optional tool availability
   anymd version                       Print the version
 
+Outline options:
+      --format <mode>      tree (CLI default) or json; --json also selects JSON
+                           --ocr, --images and --revisions match node read options
+
 Read options:
+      --node <id>          Read a node from outline; repeat it with a cursor
   -p, --pages <spec>       Pages, slides, sheets, or chapters, e.g. 1-5,8
   -o, --output <file>      Write to a file instead of stdout
       --max-tokens <n>     Stop at a token budget and print a cursor
       --cursor <cursor>    Continue from a cursor
-      --ocr / --no-ocr     Force or disable OCR (default: automatic when tesseract is installed)
-      --transcript         Transcribe audio/video with a local whisper.cpp
-      --download-whisper-model
-                           With --transcript (implied): download the ggml model on first use
-                           (base.en, ~148 MB; ANYMD_WHISPER_MODEL_SIZE=tiny|base|small[.en])
+      --ocr [auto|vlm|tesseract]  Select local OCR; --no-ocr disables it
+      (ANYMD_OCR selects the default; auto never downloads weights)
+      --transcript         Transcribe audio/video locally with Qwen3-ASR-1.7B Q8
+      --download-asr-model
+                           With --transcript (implied): download the pinned Qwen3 model on first use
+                           (Q8, ~2.2 GB; --transcript alone never downloads)
       --images <mode>      refs (default): save images embedded in PDF/DOCX/PPTX/EPUB files to the
                            anymd cache and mark them in the Markdown; none: leave them out
       --revisions <mode>   Word tracked changes and comments: markup (default) as CriticMarkup,
@@ -58,6 +66,7 @@ pub enum Mode {
     Doctor,
     Version,
     Setup(Vec<String>),
+    Pro(Vec<String>),
     Cli(Vec<String>),
 }
 
@@ -69,6 +78,7 @@ pub fn mode(arguments: &[String]) -> Mode {
         Some("doctor") => return Mode::Doctor,
         Some("version") => return Mode::Version,
         Some("setup") => return Mode::Setup(arguments[1..].to_vec()),
+        Some("pro") => return Mode::Pro(arguments[1..].to_vec()),
         _ => {}
     }
     let only_server_flags = arguments
@@ -81,14 +91,16 @@ pub fn mode(arguments: &[String]) -> Mode {
 }
 
 struct Parsed {
+    node: Option<String>,
+    format: Option<String>,
     inputs: Vec<String>,
     pages: Option<String>,
     output: Option<String>,
     max_tokens: Option<u32>,
     cursor: Option<String>,
-    ocr: Option<bool>,
+    ocr: Option<crate::ocr_vlm::OcrSelection>,
     transcript: bool,
-    download_whisper_model: bool,
+    download_asr_model: bool,
     images: Option<String>,
     revisions: Option<String>,
     front_matter: bool,
@@ -101,6 +113,8 @@ struct Parsed {
 
 fn parse(arguments: &[String]) -> Result<Parsed, String> {
     let mut parsed = Parsed {
+        node: None,
+        format: None,
         inputs: Vec::new(),
         pages: None,
         output: None,
@@ -108,7 +122,7 @@ fn parse(arguments: &[String]) -> Result<Parsed, String> {
         cursor: None,
         ocr: None,
         transcript: false,
-        download_whisper_model: false,
+        download_asr_model: false,
         images: None,
         revisions: None,
         front_matter: false,
@@ -140,11 +154,36 @@ fn parse(arguments: &[String]) -> Result<Parsed, String> {
                         .map_err(|_| "--max-tokens needs a number".to_string())?,
                 )
             }
+            "--node" => parsed.node = Some(value(flag)?),
+            "--format" => parsed.format = Some(value(flag)?),
+            "--json" => parsed.format = Some("json".into()),
             "--cursor" => parsed.cursor = Some(value(flag)?),
-            "--ocr" => parsed.ocr = Some(true),
-            "--no-ocr" => parsed.ocr = Some(false),
+            "--ocr" => {
+                let is_engine = iter
+                    .peek()
+                    .is_some_and(|v| matches!(v.as_str(), "auto" | "vlm" | "tesseract"));
+                let named = inline.or_else(|| {
+                    if is_engine {
+                        iter.next().cloned()
+                    } else {
+                        None
+                    }
+                });
+                parsed.ocr = Some(match named {
+                    Some(v) => crate::ocr_vlm::OcrSelection::parse(&v)?,
+                    None => crate::ocr_vlm::OcrSelection::Enabled(true),
+                });
+            }
+            "--no-ocr" => parsed.ocr = Some(crate::ocr_vlm::OcrSelection::Enabled(false)),
             "--transcript" => parsed.transcript = true,
-            "--download-whisper-model" => parsed.download_whisper_model = true,
+            "--download-asr-model" | "--download-whisper-model" => {
+                if inline.is_some() {
+                    return Err(format!(
+                        "{flag} is a presence switch and does not accept a value"
+                    ));
+                }
+                parsed.download_asr_model = true;
+            }
             "--images" => {
                 let mode = value(flag)?;
                 if mode != "refs" && mode != "none" {
@@ -221,8 +260,9 @@ pub fn run(arguments: Vec<String>, policy: &SourceAccessPolicy) -> i32 {
         println!("anymd {}", crate::SERVER_VERSION);
         return 0;
     }
+    let is_outline = arguments.first().map(String::as_str) == Some("outline");
     let is_search = arguments.first().map(String::as_str) == Some("search");
-    let parsed = match parse(if is_search {
+    let parsed = match parse(if is_search || is_outline {
         &arguments[1..]
     } else {
         &arguments[..]
@@ -233,7 +273,27 @@ pub fn run(arguments: Vec<String>, policy: &SourceAccessPolicy) -> i32 {
             return 2;
         }
     };
-    let (text, failed) = if is_search {
+    let (text, failed) = if is_outline {
+        if parsed.inputs.len() != 1 {
+            eprintln!("anymd: outline needs one file or URL");
+            return 2;
+        }
+        let args = crate::schema::OutlineArgs {
+            timeline: None,
+            source: parsed.inputs[0].clone(),
+            format: parsed.format.clone().or(Some("tree".into())),
+            ocr: parsed.ocr,
+            images: parsed.images.clone(),
+            revisions: parsed.revisions.clone(),
+        };
+        match crate::outline::render(&args, policy) {
+            Ok(text) => (text, false),
+            Err(message) => {
+                eprintln!("anymd: {message}");
+                return 2;
+            }
+        }
+    } else if is_search {
         let Some((query, sources)) = parsed.inputs.split_first() else {
             eprintln!("anymd: search needs a query");
             return 2;
@@ -282,13 +342,15 @@ pub fn run(arguments: Vec<String>, policy: &SourceAccessPolicy) -> i32 {
                 input.clone()
             };
             let args = ReadArgs {
+                timeline: None,
                 source,
+                node: parsed.node.clone(),
                 pages: parsed.pages.clone(),
                 max_tokens: parsed.max_tokens,
                 cursor: parsed.cursor.clone(),
                 ocr: parsed.ocr,
                 transcript: Some(parsed.transcript),
-                download_whisper_model: Some(parsed.download_whisper_model),
+                download_asr_model: Some(parsed.download_asr_model),
                 images: parsed.images.clone(),
                 revisions: parsed.revisions.clone(),
             };
@@ -332,6 +394,9 @@ pub fn run(arguments: Vec<String>, policy: &SourceAccessPolicy) -> i32 {
 }
 
 fn error_line(front_matter: &str) -> String {
+    if front_matter.trim_end() == crate::ocr_vlm::SETUP_NOTICE {
+        return format!("{}\n", crate::ocr_vlm::SETUP_NOTICE);
+    }
     front_matter
         .lines()
         .find_map(|line| line.strip_prefix("error: "))
@@ -356,6 +421,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_ocr_without_consuming_a_filename() {
+        use crate::ocr_vlm::{OcrEngine, OcrSelection};
+        assert_eq!(
+            parse(&args(&["--ocr", "vlm", "scan.png"])).unwrap().ocr,
+            Some(OcrSelection::Engine(OcrEngine::Vlm))
+        );
+        let legacy = parse(&args(&["--ocr", "scan.png"])).unwrap();
+        assert_eq!(legacy.inputs, ["scan.png"]);
+        assert_eq!(legacy.ocr, Some(OcrSelection::Enabled(true)));
+        assert_eq!(
+            parse(&args(&["scan.png", "--ocr=tesseract"])).unwrap().ocr,
+            Some(OcrSelection::Engine(OcrEngine::Tesseract))
+        );
+        assert!(parse(&args(&["--ocr=remote", "scan.png"])).is_err());
+    }
+
+    #[test]
     fn parses_read_and_search_options() {
         let parsed = parse(&args(&[
             "a.pdf",
@@ -368,7 +450,10 @@ mod tests {
         assert_eq!(parsed.inputs, ["a.pdf"]);
         assert_eq!(parsed.pages.as_deref(), Some("1-3"));
         assert_eq!(parsed.max_tokens, Some(500));
-        assert_eq!(parsed.ocr, Some(false));
+        assert_eq!(
+            parsed.ocr,
+            Some(crate::ocr_vlm::OcrSelection::Enabled(false))
+        );
         let parsed = parse(&args(&["attention", "docs", "--mode", "ranked", "-w"])).unwrap();
         assert_eq!(parsed.inputs, ["attention", "docs"]);
         assert_eq!(parsed.mode.as_deref(), Some("ranked"));
@@ -382,9 +467,22 @@ mod tests {
         let parsed = parse(&args(&["a.docx", "--revisions=reject"])).unwrap();
         assert_eq!(parsed.revisions.as_deref(), Some("reject"));
         assert!(parse(&args(&["a.docx", "--revisions", "all"])).is_err());
+        let parsed = parse(&args(&["talk.mp4", "--download-asr-model"])).unwrap();
+        assert!(parsed.download_asr_model);
         let parsed = parse(&args(&["talk.mp4", "--download-whisper-model"])).unwrap();
-        assert!(parsed.download_whisper_model);
+        assert!(parsed.download_asr_model);
         assert_eq!(parsed.inputs, ["talk.mp4"]);
+    }
+
+    #[test]
+    fn download_presence_switches_reject_inline_values() {
+        for flag in ["--download-asr-model", "--download-whisper-model"] {
+            for value in ["false", "true", "invalid", "", "0", "1"] {
+                assert!(parse(&args(&["talk.mp4", &format!("{flag}={value}")])).is_err());
+            }
+        }
+        let parsed = parse(&args(&["talk.mp4", "--transcript"])).unwrap();
+        assert!(!parsed.download_asr_model);
     }
 
     #[test]
@@ -394,13 +492,15 @@ mod tests {
         std::fs::write(&path, "a,b\n1,2\n").unwrap();
         let (text, failed) = read_text(
             &ReadArgs {
+                timeline: None,
                 source: path.display().to_string(),
+                node: None,
                 pages: None,
                 max_tokens: None,
                 cursor: None,
                 ocr: None,
                 transcript: None,
-                download_whisper_model: None,
+                download_asr_model: None,
                 images: None,
                 revisions: None,
             },

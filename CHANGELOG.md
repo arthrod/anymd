@@ -1,5 +1,64 @@
 # Changelog
 
+## 8.5.3
+
+### Patch Changes
+
+- Update PDF rendering to hayro 0.8 while keeping the existing rounded-up pixel bounds, white background and page-to-pixel coordinates, including fractional page sizes.
+- Fix optional MCP arguments appearing in `required` in `tools/list`. Strict clients such as OpenCode can now omit `read`'s `transcript`, `download_asr_model`, `images` and `revisions`, and `search`'s `case_sensitive` and `whole_word`. Required arguments, nullable types, allowed values and limits are unchanged. Regression tests cover every listed tool and the legacy search schema. Thanks to [@lenucksi](https://github.com/lenucksi) for the detailed report and reproduction ([#881](https://github.com/SylphxAI/anymd/issues/881)).
+
+## 8.5.2
+
+### Patch Changes
+
+- Update the shared licence library to `sylphx-mcp-kit` 0.7.3, including its loopback checkout fix. A local checkout contract test covers claim creation, waiting for payment and saving a verified licence. `anymd pro buy` still opens the Pro page until the checkout service is enabled; existing licence tokens and file locations are unchanged.
+
+## 8.5.1
+
+### Patch Changes
+
+- anymd now re-checks the OCR engine program (`anymd-ocr-vlm`) every time it starts to use it, not only when it is installed, so a changed or replaced file is caught before it runs. A brief "text file busy" error while the engine is being refreshed no longer fails the run; anymd retries it.
+
+- When OCR runs on a page or image and finds no text, the result now says `OCR found no text` instead of looking like a page that was never read.
+
+- `anymd pro buy [--no-browser] [--json]` opens the Pro page; in-terminal purchase turns on when the checkout service is live. `anymd pro activate` and `anymd pro status` are unchanged, and existing tokens and token files keep working (same key, `ANYMD_PRO_TOKEN`, and `<config dir>/anymd/pro-token`). The licence code now comes from `sylphx-mcp-kit` 0.6, so `anymd pro status` also shows where the token was read and warns before a licence with an expiry runs out.
+
+## 8.5.0
+
+### Minor Changes
+
+- The default `anymd` binary is smaller: about 25 MB instead of 35 MB on Linux x64, with no change to anything it converts. The local VLM OCR engine moved out into its own small program, `anymd-ocr-vlm` (about 10 MB). `anymd setup ocr` downloads it in the same one-time step as the model weights; anymd checks a signature from a key built into anymd itself (bound to this exact version), downloads over HTTPS only, and checks the program's own version before installing it. `--ocr vlm` needs the same setup as before, and its output is unchanged. After an upgrade, anymd refreshes the 10 MB engine once by itself for anyone who already ran `anymd setup ocr`; the 2 GB model weights are never downloaded without asking. If you ask for VLM OCR before running `anymd setup ocr`, anymd says `VLM OCR needs a one-time setup: run `anymd setup ocr``; over MCP that is a normal reply rather than an error. Tesseract OCR and every other feature need no setup. Builds from source with `--features ocr-vlm` keep the engine inside the binary.
+
+- `read` now marks scanned PDF pages it could not read. A page with no text layer that images cover gets `<!-- page N: scanned image, no text layer; enable OCR to read it: anymd setup ocr / ocr: true -->` after its page marker, the front matter gains `scanned_pages: [N, …]`, and a result made only of scans opens with a one-line hint, so agents can tell an empty page from an unread scan. Pages with text, and pages OCR reads, are unchanged.
+
+### Patch Changes
+
+- Fix `read` returning nothing for searchable scanned PDFs. Their OCR text layer is drawn in rendering mode 3 (`3 Tr`, invisible text over the page image) and was dropped. It is now read, with its position and a `<!-- text layer: invisible, over page image -->` marker, but only on a scanned page: fewer than 24 visible letters and digits, with scan-like images (both sides at least 48 px and at least 50 dpi, read from the image dictionary without decoding) covering at least half of the page, and the text lying over such an image. Invisible text anywhere else stays dropped (#776): it is how hidden instructions are slipped to agents. That now also holds for rotated text, which previously skipped the check. Invisible text that repeats visible text is dropped as a duplicate, and clip-only text (mode 7) is still left out. Cite-check and region geometry already indexed invisible text with its location.
+
+## 8.4.0
+
+The anymd core stays free and open source (MIT), forever; nothing that was free before is now paid. 8.4.0 adds anymd Pro (US$29 once): video evidence and cite-check. Pro funds development.
+
+### Minor Changes
+
+- anymd Pro licence check. `anymd pro status` and `anymd pro activate <token>` manage an offline-verified (Ed25519) licence, read from `ANYMD_PRO_TOKEN` or `<config dir>/anymd/pro-token`. Pro unlocks only the new operations below; everything that was free before 8.4.0 stays free, MIT and ungated. Without a licence, the Pro operations return a short message with the link instead of doing any work. See [anymd Pro](https://sylphxai.github.io/anymd/pro).
+
+- (anymd Pro) Add bounded local video timelines and decoded frames to `inspect`, with matching `read` and `outline` projections. Cuts are heuristic FFmpeg scene-score 0.4 detections, not semantic scenes or confidence values. Chapters and timed subtitle/ASR cues retain their playback clock and source hash. Optional OCR and captions are sampled single-frame observations; OCR reuses the existing request permit, and captions need a user-configured local-command adapter, with no built-in captioning. Malformed subtitle files become a subtitles gap instead of failing the request. Frames, manifests and successful captions share the existing generated-image cache budget. Ordinary reads remain unchanged without `timeline`.
+
+- (anymd Pro) Add `inspect` operation `cite_check` for deterministic PDF quote and location checks. Exact, case-sensitive matching is the default; optional `whitespace_v1` only collapses and trims whitespace. Results distinguish supported quotes, complete non-matches and insufficient evidence, keep native/OCR geometry provenance, and check source SHA-256 when requested. This checks extracted text at a location, not semantic truth or OCR accuracy.
+
+## 8.3.0
+
+### Minor Changes
+
+- Add an opt-in local doc-VLM OCR route using PaddleOCR-VL-1.6 and PP-DocLayoutV3 on Candle, including Metal on Macs. `anymd setup ocr` installs SHA-256-pinned weights; `ocr` accepts auto, vlm and tesseract alongside the existing MCP booleans. Automatic OCR never downloads models. The worker has a hard page deadline, a per-region token cap, decode-time repetition stopping, shared OCR admission, and a fail-fast aggregate PDF deadline. Tables become Markdown and formulas become LaTeX. Experimental CPU q8/q4 decoder quantization is available through `ANYMD_OCR_QUANTIZATION`; Linux arm64 checks actual FP16 hardware and keeps the plain CLI on older machines.
+
+- Local transcripts now use bundled transcribe-cpp and one Qwen3-ASR-1.7B Q8 model for every language; the Whisper engine is removed. Pinned weights download only when explicitly requested and are SHA-256 verified. Long audio uses bounded 20-second chunks with source-relative segment timestamps. Optional Qwen3-ForcedAligner via standalone CrispASR supplies validated word timestamps where available. `download_asr_model` / `--download-asr-model` replaces the old spelling, which remains a Qwen-only compatibility alias. Japanese trails whisper-turbo on the 200-utterance FLEURS sample (5.93 vs 4.80 raw CER; 5.56 vs 4.59 with symmetric numeral/kana normalization), an accepted one-model trade-off. ASR benchmark tables publish both raw and explicitly named normalized scoring; they do not claim to reproduce Qwen's official scores.
+
+- New `outline` MCP tool and `anymd outline <file>` CLI command return a local, deterministic heading tree for PDF, DOCX, PPTX, EPUB, HTML and Markdown, as JSON or tree text. Nodes carry stable ids, title paths, page/slide/chapter ranges, Markdown byte ranges and child counts. `read` gains `node` (`--node` on the CLI), with the existing page selections, token budgets and cursors. Literal and ranked `search` hits carry node ids and title paths. Reads without a node keep their output unchanged.
+
+- The platform wheel includes a thin Python API: `from anymd import convert` returns a `Document` with Markdown text and source metadata. Optional `langchain` and `llamaindex` extras provide `AnyMDLoader` and `AnyMDReader`, using the same native converter without downloading another binary.
+
 ## 8.2.0
 
 ### Minor Changes

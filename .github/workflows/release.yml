@@ -1,3 +1,4 @@
+# optimistic-merge: advisory
 name: release
 
 # Publishes when packages/anymd/package.json carries a version that is not on
@@ -9,8 +10,11 @@ name: release
 # `crates` job publishes the Rust crates to crates.io (`cargo install anymd`).
 # The `wheels` and `pypi` jobs publish platform wheels to PyPI (`pip install
 # anymd`, `uvx anymd`) and `image` pushes ghcr.io/sylphxai/anymd, both from the
-# release's native binaries. The `trust` job then adds an SBOM and SHA256SUMS to the GitHub release and
-# signs every asset with a GitHub artifact attestation.
+# release's native binaries. The `companion*` jobs build the VLM OCR engine
+# (`anymd-ocr-vlm`, which `anymd setup ocr` downloads) per platform and attach
+# it with its checksum manifest to the GitHub release. The `trust` job then adds
+# an SBOM and SHA256SUMS to the GitHub release and signs every asset with a
+# GitHub artifact attestation.
 
 on:
   push:
@@ -26,18 +30,24 @@ concurrency:
 
 jobs:
   release:
-    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@v0
+    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@5da4b0376fbbfd114056ccfb888fb98cf202bba5
     # packages: write is only used by the kit's optional GHCR image job, which
     # anymd skips; GitHub still checks every called job's permissions.
     permissions:
       contents: write
       id-token: write
       packages: write
+    # Only the tap/bucket publisher credentials reach the shared workflow.
+    secrets:
+      TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
+      TAP_APP_PRIVATE_KEY: ${{ secrets.TAP_APP_PRIVATE_KEY }}
     with:
       name: anymd
       cargo-package: anymd
       # MCP Bundle (.mcpb) for Claude Desktop, attached to the GitHub release.
       mcpb: true
+      homebrew: true
+      scoop: true
       mcpb-icon: brand/app-icon/icon-512.png
       npm-package: '@sylphx/anymd'
       mcp-name: io.github.SylphxAI/anymd
@@ -64,25 +74,207 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
 
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/publish-crates.sh
 
+  # The VLM OCR engine is not in the default binary. It is built per platform
+  # as the `anymd-ocr-vlm` companion and attached to the GitHub release as
+  # `anymd-ocr-vlm-<platform>` plus the manifest `anymd-ocr-vlm-SHA256SUMS`
+  # that `anymd setup ocr` verifies. Same targets and build recipe as the kit's
+  # native build. A release that already has the manifest is skipped, and the
+  # manifest is uploaded last, so a failed run can be rerun.
+  companion-plan:
+    needs: release
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      todo: ${{ steps.plan.outputs.todo }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v=$(jq -r .version packages/anymd/package.json)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if ! gh release view "v$v" >/dev/null 2>&1; then
+            echo "no release v$v yet; no companion"
+            echo "todo=false" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$v" --json assets --jq '.assets[].name' | grep -qx anymd-ocr-vlm-SHA256SUMS; then
+            echo "release v$v already carries the companion manifest"
+            echo "todo=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "todo=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  companion-build:
+    needs: companion-plan
+    if: needs.companion-plan.outputs.todo == 'true'
+    name: companion ${{ matrix.key }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { key: darwin-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { key: darwin-x64, os: macos-latest, target: x86_64-apple-darwin }
+          - { key: linux-x64-gnu, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: '2.17' }
+          - { key: linux-arm64-gnu, os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zig: '2.17' }
+          - { key: win32-x64-msvc, os: windows-latest, target: x86_64-pc-windows-msvc, exe: '.exe' }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: companion-${{ matrix.target }}
+
+      - if: matrix.zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+
+      - if: matrix.zig
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Build the companion
+        shell: bash
+        env:
+          V: ${{ needs.companion-plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anymd") | .version')" = "$V"
+          if [ -n "${{ matrix.zig }}" ]; then
+            cargo zigbuild --release --locked -p anymd --features ocr-vlm --bin anymd-ocr-vlm --target ${{ matrix.target }}.${{ matrix.zig }}
+          else
+            cargo build --release --locked -p anymd --features ocr-vlm --bin anymd-ocr-vlm --target ${{ matrix.target }}
+          fi
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/anymd-ocr-vlm${{ matrix.exe }}" "out/anymd-ocr-vlm-${{ matrix.key }}${{ matrix.exe }}"
+
+      - name: Run it (native targets)
+        if: matrix.key != 'linux-arm64-gnu' && matrix.key != 'darwin-x64'
+        shell: bash
+        env:
+          V: ${{ needs.companion-plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x out/anymd-ocr-vlm-*
+          ./out/anymd-ocr-vlm-${{ matrix.key }}${{ matrix.exe }} version | grep -Fx "anymd-ocr-vlm $V"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: companion-${{ matrix.key }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  companion:
+    needs: [companion-plan, companion-build]
+    if: always() && needs.companion-build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The signing key lives only in this environment (main branch only).
+    environment: companion-signing
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the signing script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/sign-companion-manifest.py
+            scripts/sign-requirements.txt
+            crates/anymd/src/ocr_vlm.rs
+          path: repo
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # No secret is in scope here: only hash-pinned binary wheels install.
+      - name: Install the signing dependencies
+        run: |
+          pip install --only-binary :all: --require-hashes -r repo/scripts/sign-requirements.txt
+
+      - name: Download the companions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: companion-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build the manifest
+        run: |
+          set -euo pipefail
+          cd artifacts
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+          sha256sum -- anymd-ocr-vlm-* > anymd-ocr-vlm-SHA256SUMS
+          cat anymd-ocr-vlm-SHA256SUMS
+
+      # The only step that sees the key. The signature covers "anymd-ocr-vlm $V\n"
+      # + the manifest; the script never echoes the key and refuses a key that
+      # is not compiled into anymd.
+      - name: Sign the manifest
+        env:
+          V: ${{ needs.companion-plan.outputs.version }}
+          ANYMD_COMPANION_SIGNING_KEY: ${{ secrets.ANYMD_COMPANION_SIGNING_KEY }}
+        run: python3 repo/scripts/sign-companion-manifest.py "$V" artifacts/anymd-ocr-vlm-SHA256SUMS artifacts/anymd-ocr-vlm-SHA256SUMS.sig
+
+      - name: Attach the companions and the manifest to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          V: ${{ needs.companion-plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # The signature goes before the manifest, and the manifest last: an
+          # interrupted run leaves none, so the next run redoes all.
+          for asset in anymd-ocr-vlm-darwin-* anymd-ocr-vlm-linux-* anymd-ocr-vlm-win32-*; do
+            gh release upload "v$V" "$asset" --clobber
+          done
+          gh release upload "v$V" anymd-ocr-vlm-SHA256SUMS.sig --clobber
+          gh release upload "v$V" anymd-ocr-vlm-SHA256SUMS --clobber
+
   # Trust pack for a new release: a CycloneDX SBOM, SHA256SUMS over every other
   # asset, and a signed build provenance attestation for each asset (binaries
   # and .mcpb bundles included). A release that already has SHA256SUMS is
   # skipped, so every push to main is safe and a failed run can be rerun.
   trust:
-    needs: release
-    if: needs.release.result == 'success'
+    needs: [release, companion-plan, companion-build, companion]
+    # The companions are release assets too, so they join SHA256SUMS and the
+    # attestations; `skipped` means they were already attached.
+    if: always() && !cancelled() && needs.release.result == 'success' && needs.companion-build.result != 'failure' && needs.companion.result != 'failure' && needs.companion-plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -91,7 +283,7 @@ jobs:
       attestations: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -115,7 +307,7 @@ jobs:
 
       - name: Set up Rust
         if: steps.rel.outputs.todo == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
 
       - name: Download the release assets
         if: steps.rel.outputs.todo == 'true'
@@ -166,18 +358,21 @@ jobs:
           gh release upload "v$V" "assets/anymd-$V.cdx.json" --clobber
           gh release upload "v$V" assets/SHA256SUMS --clobber
 
-  # Platform wheels for PyPI, built from the release's native binaries (the
-  # `native-*` artifacts of this run; a run with no new version has none).
+  # Platform wheels use this run's natives, or the matching tagged release's
+  # verified trust pack when PyPI delivery is incomplete. No Rust rebuild.
   wheels:
-    needs: release
-    if: needs.release.result == 'success'
+    needs: [release, trust]
+    if: always() && !cancelled() && needs.release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
     outputs:
       built: ${{ steps.build.outputs.built }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -189,23 +384,9 @@ jobs:
 
       - name: Build the wheels
         id: build
-        run: |
-          set -euo pipefail
-          if ! ls artifacts/native-*/* >/dev/null 2>&1; then
-            echo "no new release in this run; no wheels"
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          v=$(jq -r .version packages/anymd/package.json)
-          a=artifacts
-          python3 scripts/build-wheels.py --version "$v" --out dist \
-            --binary "manylinux_2_17_x86_64.manylinux2014_x86_64=$a/native-linux-x64-gnu/anymd" \
-            --binary "manylinux_2_17_aarch64.manylinux2014_aarch64=$a/native-linux-arm64-gnu/anymd" \
-            --binary "macosx_10_12_x86_64=$a/native-darwin-x64/anymd" \
-            --binary "macosx_11_0_arm64=$a/native-darwin-arm64/anymd" \
-            --binary "win_amd64=$a/native-win32-x64-msvc/anymd.exe"
-          ls -l dist
-          echo "built=true" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/recover-wheels.py --artifacts artifacts --out dist
 
       - name: Smoke the Linux wheel (pip install, then convert a PDF)
         if: steps.build.outputs.built == 'true'
@@ -215,6 +396,7 @@ jobs:
           /tmp/venv/bin/pip install dist/*manylinux_2_17_x86_64*.whl
           /tmp/venv/bin/anymd version
           /tmp/venv/bin/anymd test/fixtures/sample.pdf | grep -q '<!-- page 1 -->'
+          /tmp/venv/bin/python -c 'from anymd import convert; assert "<!-- page 1 -->" in convert("test/fixtures/sample.pdf").text'
           /tmp/venv/bin/pip install twine
           /tmp/venv/bin/twine check dist/*.whl
 
@@ -246,7 +428,7 @@ jobs:
           path: dist
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: dist
           skip-existing: true
@@ -267,7 +449,7 @@ jobs:
       IMAGE: ghcr.io/sylphxai/anymd
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -279,23 +461,57 @@ jobs:
 
       - name: Stage the binaries
         id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if ! ls artifacts/native-linux-x64-gnu/anymd >/dev/null 2>&1; then
+          v=$(jq -r .version packages/anymd/package.json)
+          mkdir -p dist/amd64 dist/arm64
+          if [ -f artifacts/native-linux-x64-gnu/anymd ]; then
+            cp artifacts/native-linux-x64-gnu/anymd dist/amd64/
+            cp artifacts/native-linux-arm64-gnu/anymd dist/arm64/
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
+            # A recovery run on main has no native artifacts: reuse the exact
+            # binaries already attached to this version's GitHub release.
+            mkdir -p assets
+            gh release download "v$v" --dir assets \
+              --pattern anymd-linux-x64-gnu.tar.gz \
+              --pattern anymd-linux-arm64-gnu.tar.gz \
+              --pattern anymd-linux-x64-gnu.identity.json \
+              --pattern anymd-linux-arm64-gnu.identity.json
+            for platform in linux-x64-gnu linux-arm64-gnu; do
+              mkdir -p "artifacts/native-$platform"
+              tar -xzf "assets/anymd-$platform.tar.gz" -C "artifacts/native-$platform" anymd
+              cp "assets/anymd-$platform.identity.json" "artifacts/native-$platform/identity.json"
+            done
+            cp artifacts/native-linux-x64-gnu/anymd dist/amd64/
+            cp artifacts/native-linux-arm64-gnu/anymd dist/arm64/
+            git fetch --no-tags origin "refs/tags/v$v:refs/tags/v$v"
+            tag_source=$(git rev-parse "v$v^{commit}")
+          else
             echo "no new release in this run; no image"
             echo "build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          mkdir -p dist/amd64 dist/arm64
-          cp artifacts/native-linux-x64-gnu/anymd dist/amd64/
-          cp artifacts/native-linux-arm64-gnu/anymd dist/arm64/
+          binary_source=$(python3 scripts/recover-wheels.py --artifacts artifacts --image-source)
+          test "$binary_source" = "${tag_source:-$binary_source}"
+          # Packaging executes from this workflow's reviewed checkout; payload
+          # notices and native identities remain bound to the original source.
+          git fetch --no-tags origin "$binary_source"
+          git show "$binary_source:LICENSE" > LICENSE
+          echo "source=$binary_source" >> "$GITHUB_OUTPUT"
+          test -s dist/amd64/anymd
+          test -s dist/arm64/anymd
+          chmod +x dist/amd64/anymd dist/arm64/anymd
+          dist/amd64/anymd version | grep -Fx "anymd $v"
           echo "build=true" >> "$GITHUB_OUTPUT"
           echo "version=$(jq -r .version packages/anymd/package.json)" >> "$GITHUB_OUTPUT"
 
       - name: Image tags and OCI labels
         if: steps.stage.outputs.build == 'true'
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -309,15 +525,17 @@ jobs:
             org.opencontainers.image.documentation=https://sylphxai.github.io/anymd/
             org.opencontainers.image.vendor=Sylphx
             io.modelcontextprotocol.server.name=io.github.SylphxAI/anymd
+            io.sylphx.native.source=${{ steps.stage.outputs.source }}
+            io.sylphx.packaging.source=${{ github.sha }}
 
       - if: steps.stage.outputs.build == 'true'
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - if: steps.stage.outputs.build == 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - if: steps.stage.outputs.build == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -326,7 +544,7 @@ jobs:
       - name: Build and push
         if: steps.stage.outputs.build == 'true'
         id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.release
@@ -347,7 +565,14 @@ jobs:
         if: steps.stage.outputs.build == 'true'
         env:
           V: ${{ steps.stage.outputs.version }}
+          NATIVE_SOURCE: ${{ steps.stage.outputs.source }}
+          PACKAGING_SOURCE: ${{ github.sha }}
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "$IMAGE:$V"
           docker run --rm "$IMAGE:$V" version
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.sylphx.native.source" }}' "$IMAGE:$V")" = "$NATIVE_SOURCE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.sylphx.packaging.source" }}' "$IMAGE:$V")" = "$PACKAGING_SOURCE"
+          docker run --rm --entrypoint cat "$IMAGE:$V" \
+            /usr/share/licenses/anymd/LICENSE > image-license
+          cmp LICENSE image-license
